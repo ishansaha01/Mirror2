@@ -20,20 +20,34 @@ class ResultPathSystem(object):
         return subdir
 
     def createResultSubDirFromPath(self, path):
+        # Check if path is None
+        if path is None:
+            print("Error: Video path is None")
+            return None
+            
         filename = os.path.basename(path)
         ext_idx = filename.rfind(".")
-        if(filename[ext_idx:] != ".mp4"):
-            print("The video path you try to create prediction for does't have .mp4 extension")
-            assert(True)
-        subDirName = filename[:ext_idx]
+        if ext_idx == -1 or (filename[ext_idx:] != ".mp4"):
+            print(f"The video path you try to create prediction for doesn't have .mp4 extension: {path}")
+            # Create a default directory name if extension is not valid
+            subDirName = filename
+        else:
+            subDirName = filename[:ext_idx]
+            
         subdir = os.path.join(self.data_results_dir, subDirName)
         if os.path.exists(subdir):
-            return
+            return subdir
         OSUtil.safe_mkdir(subdir)
         return subdir
 
     def getVideoResultWriterFromPath(self, path):
         subdir = self.createResultSubDirFromPath(path)
+        if subdir is None:
+            print(f"Warning: Could not create result directory for path: {path}")
+            # Create a default directory to avoid NoneType errors
+            default_dir = os.path.join(self.data_results_dir, "default_results")
+            OSUtil.safe_mkdir(default_dir)
+            return VideoResult(default_dir)
         return VideoResult(subdir)
 
     def getVideoResultWriterFromName(self, subDirName):
