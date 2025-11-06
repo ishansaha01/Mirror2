@@ -51,7 +51,6 @@ cd ~/Mirror2/scripts
 
 # Run prediction script
 # Data structure expected: data_dir/val/category_name/video_files.mp4
-# Current test data: /scratch/network/is1893/mirror2_data/dataSets/test_data/val/fireworks/FireworkVertical.mov
 python predict.py --data_dir /scratch/network/is1893/mirror2_data/dataSets/test_data \
     --ngpu 1 --nepoch 1 --nworker 4 \
     --label_type none \

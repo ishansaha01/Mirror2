@@ -24,7 +24,7 @@ logger = logging.getLogger('video_sync')
 # Define the base directory for browsing
 DEFAULT_BASE_DIR = "/home/is1893/Mirror2/dataSets/test_data"
 RESULTS_DIR = "/home/is1893/Mirror2/dataSets/test_data/results"
-DEFAULT_VIDEO = "/home/is1893/Mirror2/dataSets/test_data/val/fireworks/Firework.mp4"
+DEFAULT_VIDEO = "/home/is1893/Mirror2/dataSets/test_data/val/Hip_hop_dance_basic_teaching/Hip_hop_dance_basic_teaching.mp4"
 
 # Function to map video frames to eventfulness datapoints
 def map_frame_to_datapoint(frame_number, video_frame_count, eventfulness_length):
@@ -93,6 +93,30 @@ def list_directories_and_videos(directory):
     
     return items
 
+# Function to list only MP4 files in the val directory
+def list_mp4_files(directory="/home/is1893/Mirror2/dataSets/test_data/val/"):
+    """List only MP4 files in the given directory and its subdirectories."""
+    items = []
+    
+    try:
+        # Walk through the directory and its subdirectories
+        for root, _, files in os.walk(directory):
+            for file in sorted(files):
+                if file.lower().endswith('.mp4'):
+                    file_path = os.path.join(root, file)
+                    # Get the relative path from the base directory for display
+                    rel_path = os.path.relpath(root, directory)
+                    display_name = file if rel_path == '.' else os.path.join(rel_path, file)
+                    items.append({
+                        "name": display_name, 
+                        "type": "video", 
+                        "path": file_path
+                    })
+    except Exception:
+        pass
+    
+    return items
+
 # Initialize the Dash app
 app = dash.Dash(__name__, suppress_callback_exceptions=True)
 server = app.server
@@ -136,7 +160,7 @@ app.layout = html.Div([
     html.H1("Video Eventfulness Analyzer"),
     
     # Store components to keep track of state
-    dcc.Store(id='current-directory', data=DEFAULT_BASE_DIR),
+    dcc.Store(id='current-directory', data="/home/is1893/Mirror2/dataSets/test_data/val/"),
     dcc.Store(id='current-video', data=default_video_path),
     dcc.Store(id='video-info', data=default_video_info),
     dcc.Store(id='eventfulness-data', data=default_eventfulness_data),
@@ -145,18 +169,9 @@ app.layout = html.Div([
     html.Div([
         # File browser sidebar
         html.Div([
-            html.H3("File Browser"),
+            html.H3("MP4 Files"),
             
-            # Directory path input
-            dcc.Input(
-                id='directory-input',
-                type='text',
-                placeholder='Enter directory path...',
-                value=DEFAULT_BASE_DIR,
-                style={'width': '100%'}
-            ),
-            
-            # Directory contents
+            # Directory contents (no input field)
             html.Div(id='directory-contents'),
             
         ], style={'width': '25%', 'float': 'left', 'padding': '10px', 'borderRight': '1px solid #ccc'}),
@@ -199,52 +214,28 @@ app.layout = html.Div([
 # Callback to update directory contents
 @callback(
     Output('directory-contents', 'children'),
-    Input('directory-input', 'value'),
     Input('current-directory', 'data')
 )
-def update_directory_contents(input_path, current_dir):
-    # Use input path if provided and valid, otherwise use current directory
-    directory = input_path if os.path.isdir(input_path) else current_dir
+def update_directory_contents(current_dir):
+    # Always use the fixed directory
+    fixed_directory = "/home/is1893/Mirror2/dataSets/test_data/val/"
     
-    items = list_directories_and_videos(directory)
+    # Get only MP4 files from the fixed directory
+    items = list_mp4_files(fixed_directory)
     
-    # Create clickable items for directories and videos
+    # Create clickable items for videos
     content_elements = []
     for item in items:
-        if item["type"] == "directory":
-            button = html.Button(
-                f"📁 {item['name']}",
-                id={'type': 'dir-button', 'path': item['path']},
-                style={'display': 'block', 'width': '100%', 'textAlign': 'left', 'margin': '2px 0'}
-            )
-        else:  # video
-            button = html.Button(
-                f"🎬 {item['name']}",
-                id={'type': 'video-button', 'path': item['path']},
-                style={'display': 'block', 'width': '100%', 'textAlign': 'left', 'margin': '2px 0'}
-            )
+        button = html.Button(
+            f"🎬 {item['name']}",
+            id={'type': 'video-button', 'path': item['path']},
+            style={'display': 'block', 'width': '100%', 'textAlign': 'left', 'margin': '2px 0'}
+        )
         content_elements.append(button)
     
     return content_elements
 
-# Callback for directory navigation
-@callback(
-    Output('current-directory', 'data'),
-    Input({'type': 'dir-button', 'path': dash.ALL}, 'n_clicks'),
-    State({'type': 'dir-button', 'path': dash.ALL}, 'id'),
-    prevent_initial_call=True
-)
-def navigate_directory(n_clicks, ids):
-    # Find which button was clicked
-    ctx = dash.callback_context
-    if not ctx.triggered:
-        return dash.no_update
-    
-    button_id = ctx.triggered[0]['prop_id'].split('.')[0]
-    button_data = json.loads(button_id)
-    
-    # Return the path of the clicked directory
-    return button_data['path']
+# Directory navigation callback removed as it's no longer needed
 
 # Callback for video selection
 @callback(
@@ -261,9 +252,17 @@ def select_video(n_clicks, ids):
     if not ctx.triggered:
         return dash.no_update, dash.no_update, dash.no_update
     
-    button_id = ctx.triggered[0]['prop_id'].split('.')[0]
-    button_data = json.loads(button_id)
-    video_path = button_data['path']
+    # Get the index of the clicked button
+    triggered_id = ctx.triggered[0]['prop_id'].split('.')[0]
+    
+    # Find which button was clicked by matching the triggered ID
+    for i, n in enumerate(n_clicks):
+        if n is not None:  # This button has been clicked
+            button_data = ids[i]
+            video_path = button_data['path']
+            break
+    else:
+        return dash.no_update, dash.no_update, dash.no_update
     
     # Get video info
     import cv2
@@ -516,7 +515,9 @@ def log_video_events(playing, current_time, seek_to, current_debug):
     if trigger_id == 'video-player':
         if trigger_prop == 'playing':
             event_type = "PLAY" if playing else "PAUSE"
-            log_msg = f"[{timestamp}] VIDEO EVENT: {event_type}, Time: {current_time:.3f}s"
+            # Handle None value for current_time
+            time_str = f"{current_time:.3f}s" if current_time is not None else "N/A"
+            log_msg = f"[{timestamp}] VIDEO EVENT: {event_type}, Time: {time_str}"
             logger.info(log_msg)
             
             # Update debug info
@@ -531,16 +532,20 @@ def log_video_events(playing, current_time, seek_to, current_debug):
             debug_lines = current_debug.split('\n') if current_debug else []
             debug_lines = [log_msg] + debug_lines[:19]  # Add new line at the top, keep only last 20
             return '\n'.join(debug_lines)
-        elif trigger_prop == 'currentTime':
+        elif trigger_prop == 'currentTime' and current_time is not None:
             # Only log time updates occasionally to avoid flooding
-            if current_time % 1 < 0.1:  # Log roughly every second
-                log_msg = f"[{timestamp}] Time update: {current_time:.3f}s"
-                logger.info(log_msg)
-                
-                # Update debug info but less frequently
-                debug_lines = current_debug.split('\n') if current_debug else []
-                debug_lines = [log_msg] + debug_lines[:19]  # Add new line at the top, keep only last 20
-                return '\n'.join(debug_lines)
+            try:
+                # Safely check if we should log this time update
+                if current_time % 1 < 0.1:  # Log roughly every second
+                    log_msg = f"[{timestamp}] Time update: {current_time:.3f}s"
+                    logger.info(log_msg)
+                    
+                    # Update debug info but less frequently
+                    debug_lines = current_debug.split('\n') if current_debug else []
+                    debug_lines = [log_msg] + debug_lines[:19]  # Add new line at the top, keep only last 20
+                    return '\n'.join(debug_lines)
+            except Exception as e:
+                logger.error(f"Error in time update: {str(e)}")
     
     return current_debug
 
@@ -558,8 +563,17 @@ def log_video_events(playing, current_time, seek_to, current_debug):
     prevent_initial_call=True
 )
 def update_graph_marker(n_intervals, current_time, video_info, eventfulness_data, current_debug, current_figure):
-    if current_time is None or not video_info or not eventfulness_data or not current_figure:
-        return dash.no_update, True, current_debug
+    # Add more detailed check for current_time
+    if current_time is None or not isinstance(current_time, (int, float)) or not video_info or not eventfulness_data or not current_figure:
+        # Log the issue
+        timestamp = datetime.datetime.now().strftime("%H:%M:%S.%f")[:-3]
+        log_msg = f"[{timestamp}] Graph update skipped: current_time={current_time}, video_info={bool(video_info)}, eventfulness_data={bool(eventfulness_data)}"
+        logger.info(log_msg)
+        
+        # Update debug info
+        debug_lines = current_debug.split('\n') if current_debug else []
+        debug_lines = [log_msg] + debug_lines[:19]
+        return dash.no_update, True, '\n'.join(debug_lines)
     
     # Calculate the current frame
     fps = video_info['fps']
