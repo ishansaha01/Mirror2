@@ -144,12 +144,30 @@ app.index_string = '''
                 100% { opacity: 1; }
             }
             
+            @keyframes fadeOut {
+                0% { opacity: 1; transform: scale(1); }
+                100% { opacity: 0; transform: scale(0.8); }
+            }
+            
+            @keyframes slideLeft {
+                0% { transform: translateX(0); }
+                100% { transform: translateX(-100%); }
+            }
+            
             .pulse {
                 animation: pulse 1s infinite;
             }
             
             .blink {
                 animation: blink 1s infinite;
+            }
+            
+            .fade-out {
+                animation: fadeOut 0.5s forwards;
+            }
+            
+            .slide-left {
+                animation: slideLeft 0.5s forwards;
             }
             
             .volume-bar {
@@ -162,6 +180,33 @@ app.index_string = '''
             
             .volume-bar.active {
                 background-color: #2196F3;
+            }
+            
+            .sliding-window-frame {
+                position: absolute;
+                height: 80%;
+                width: 12%;
+                padding: 0;
+                display: flex;
+                justify-content: center;
+                align-items: center;
+                transform: translateX(-50%); /* Center horizontally */
+                pointer-events: none; /* Prevent click interactions */
+                margin: 0 2%;
+            }
+            
+            .sliding-window-frame img {
+                height: 100%;
+                max-width: 100%;
+                object-fit: contain;
+                border: 1px solid #ddd;
+                border-radius: 2px;
+                box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+            }
+            
+            /* Current frame at center */
+            .sliding-window-frame.current img {
+                border: 2px solid #ff4500;
             }
         </style>
     </head>
@@ -220,6 +265,8 @@ app.layout = html.Div([
     dcc.Store(id='video-info', data=default_video_info),
     dcc.Store(id='eventfulness-data', data=default_eventfulness_data),
     dcc.Store(id='peak-data', data=None),  # Store for detected peaks and dance steps
+    dcc.Store(id='peak-frames', data=None),  # Store for extracted frames at peaks
+    dcc.Store(id='sliding-window-frames', data=None),  # Store for sliding window frames
     
     # Main layout with file browser and content area
     html.Div([
@@ -244,6 +291,28 @@ app.layout = html.Div([
                     html.H3("Video Player"),
                     html.Div(id='video-player-container'),
                 ], id='video-section', style={'display': 'none'}),
+                
+                # Sliding window preview
+                html.Div([
+                    html.H3("Peak Frames Preview"),
+                    html.Div([
+                        # Container for sliding window frames
+                        html.Div(id='sliding-window-container', style={
+                            'display': 'flex',
+                            'flexDirection': 'row',
+                            'position': 'relative',
+                            'height': '200px',
+                            'backgroundColor': '#f0f0f0',
+                            'borderRadius': '5px',
+                            'padding': '10px',
+                            'marginBottom': '20px',
+                            'boxShadow': 'inset 0 0 10px rgba(0,0,0,0.1)',
+                            'overflow': 'hidden'
+                        }),
+                        
+
+                    ], style={'position': 'relative'}),
+                ], id='sliding-window-section', style={'display': 'none', 'marginTop': '20px', 'marginBottom': '20px'}),
                 
                 # Eventfulness graph
                 html.Div([
@@ -270,6 +339,15 @@ app.layout = html.Div([
                         ]),
                     ], style={'border': '1px solid #ddd', 'borderRadius': '5px', 'padding': '15px', 'backgroundColor': '#f9f9f9'})
                 ], id='dance-step-section', style={'display': 'none', 'marginTop': '20px'}),
+                
+                # Peak frames section
+                html.Div([
+                    html.H3("Extracted Peak Frames"),
+                    html.Div([
+                        html.Div("Frames extracted at detected peaks:", style={'marginBottom': '10px'}),
+                        html.Div(id='peak-frames-gallery', style={'display': 'flex', 'flexWrap': 'wrap', 'gap': '10px'}),
+                    ], style={'border': '1px solid #ddd', 'borderRadius': '5px', 'padding': '15px', 'backgroundColor': '#f9f9f9'})
+                ], id='peak-frames-section', style={'display': 'none', 'marginTop': '20px'}),
             ]),
         ], style={'width': '75%', 'float': 'left', 'padding': '10px'}),
     ], style={'display': 'flex', 'flexFlow': 'row'}),
@@ -277,7 +355,15 @@ app.layout = html.Div([
     # Interval for updating the graph marker
     dcc.Interval(
         id='graph-update-interval',
-        interval=100,  # Update every 100ms
+        interval=50,  # Update every 50ms for more responsiveness
+        n_intervals=0,
+        disabled=True
+    ),
+    
+    # Separate high-frequency interval for sliding window updates
+    dcc.Interval(
+        id='sliding-window-update-interval',
+        interval=10,  # Update every 30ms for smoother animations
         n_intervals=0,
         disabled=True
     ),
@@ -431,11 +517,15 @@ def update_video_info_display(video_path, video_info, eventfulness_data):
     Output('video-player-container', 'children'),
     Output('video-section', 'style'),
     Output('dance-step-section', 'style'),  # Also show the dance step section
-    Input('current-video', 'data')
+    Output('peak-frames-section', 'style'),  # Also show the peak frames section
+    Output('sliding-window-section', 'style'),  # Also show the sliding window section
+    Output('sliding-window-frames', 'data'),  # Extract frames for sliding window
+    Input('current-video', 'data'),
+    State('video-info', 'data')
 )
-def update_video_player(video_path):
-    if not video_path or not os.path.exists(video_path):
-        return dash.no_update, {'display': 'none'}, {'display': 'none'}
+def update_video_player(video_path, video_info):
+    if not video_path or not os.path.exists(video_path) or not video_info:
+        return dash.no_update, {'display': 'none'}, {'display': 'none'}, {'display': 'none'}, {'display': 'none'}, None
     
     # Create a data URL for the video
     video_url = f"/video?path={base64.b64encode(video_path.encode()).decode()}"
@@ -445,18 +535,37 @@ def update_video_player(video_path):
         url=video_url,
         controls=True,
         width='100%',
-        height='auto',
+        height='400px',
         # Use intervalCurrentTime instead of intervalDelay
-        intervalCurrentTime=100,  # Update time every 100ms
+        intervalCurrentTime=50,  # Update time more frequently (50ms)
         playing=False
     )
     
-    return player, {'display': 'block'}, {'display': 'block'}
+    # Extract frames for the sliding window - use a smaller interval for smoother preview
+    sliding_window_frames = extract_frames_for_sliding_window(
+        video_path, 
+        video_info, 
+        interval_seconds=0.25,  # Extract a frame every 0.25 seconds for smoother preview
+        window_seconds=3.0     # 3 second preview window
+    )
+    
+    return player, {'display': 'block'}, {'display': 'block'}, {'display': 'block'}, {'display': 'block'}, sliding_window_frames
+
+# Callback to handle video play/pause events
+@callback(
+    Output('graph-update-interval', 'disabled', allow_duplicate=True),
+    Input('video-player', 'playing'),
+    prevent_initial_call=True
+)
+def handle_video_playback(playing):
+    # Enable interval updates when video is playing, disable when paused
+    return not playing
 
 # Callback to update eventfulness graph
 @callback(
     Output('eventfulness-graph', 'figure'),
     Output('graph-section', 'style'),
+    Output('peak-frames', 'data'),
     Input('eventfulness-data', 'data'),
     Input('video-info', 'data'),
     Input('current-video', 'data')
@@ -464,9 +573,9 @@ def update_video_player(video_path):
 def update_eventfulness_graph(eventfulness_data, video_info, current_video):
     # Skip if no video is selected or no data available
     if not current_video or not os.path.exists(current_video) or not eventfulness_data or not video_info:
-        return dash.no_update, {'display': 'none'}
+        return dash.no_update, {'display': 'none'}, None
     if not eventfulness_data or not video_info:
-        return dash.no_update, {'display': 'none'}
+        return dash.no_update, {'display': 'none'}, None
     
     data = eventfulness_data['data']
     fps = eventfulness_data.get('fps', video_info['fps'])
@@ -479,7 +588,8 @@ def update_eventfulness_graph(eventfulness_data, video_info, current_video):
     peaks = detect_local_maxima(data)
     peak_values = [data[p] for p in peaks]
     
-    # We're only focusing on local maxima now
+    # Extract frames at peak locations
+    peak_frames = extract_frames_at_peaks(current_video, peaks, video_info, eventfulness_data)
     
     # Find the next upcoming peak
     next_peak, distance_to_peak, next_peak_value = find_next_maximum(data, initial_index, peaks)
@@ -488,6 +598,7 @@ def update_eventfulness_graph(eventfulness_data, video_info, current_video):
     logger.info(f"Creating eventfulness graph with {len(data)} data points")
     logger.info(f"Initial marker position: index={initial_index}, value={initial_value:.3f}")
     logger.info(f"Detected {len(peaks)} peaks")
+    logger.info(f"Extracted {len(peak_frames)} frames at peak locations")
     if next_peak is not None:
         logger.info(f"Next peak at index {next_peak}, distance: {distance_to_peak}, value: {next_peak_value:.3f}")
     
@@ -603,7 +714,7 @@ def update_eventfulness_graph(eventfulness_data, video_info, current_video):
         )
     )
     
-    return fig, {'display': 'block'}
+    return fig, {'display': 'block'}, peak_frames
 
 # Callback to log video player events
 @callback(
@@ -667,19 +778,21 @@ def log_video_events(playing, current_time, seek_to, current_debug):
 @callback(
     Output('eventfulness-graph', 'figure', allow_duplicate=True),
     Output('graph-update-interval', 'disabled'),
+    Output('sliding-window-update-interval', 'disabled'),  # Also control the sliding window interval
     Output('debug-info', 'children'),
     Output('next-peak-time', 'children'),
     Output('peak-value', 'children'),
     Output('volume-indicator', 'children'),
     Input('graph-update-interval', 'n_intervals'),
     Input('video-player', 'currentTime'),
+    Input('video-player', 'playing'),
     State('video-info', 'data'),
     State('eventfulness-data', 'data'),
     State('debug-info', 'children'),
     State('eventfulness-graph', 'figure'),
     prevent_initial_call=True
 )
-def update_graph_marker(n_intervals, current_time, video_info, eventfulness_data, current_debug, current_figure):
+def update_graph_marker(n_intervals, current_time, playing, video_info, eventfulness_data, current_debug, current_figure):
     # Add more detailed check for current_time
     if current_time is None or not isinstance(current_time, (int, float)) or not video_info or not eventfulness_data or not current_figure:
         # Log the issue
@@ -690,7 +803,7 @@ def update_graph_marker(n_intervals, current_time, video_info, eventfulness_data
         # Update debug info
         debug_lines = current_debug.split('\n') if current_debug else []
         debug_lines = [log_msg] + debug_lines[:19]
-        return dash.no_update, True, '\n'.join(debug_lines), "N/A", "N/A", []
+        return dash.no_update, not playing, not playing, '\n'.join(debug_lines), "N/A", "N/A", []
     
     # Calculate the current frame
     fps = video_info['fps']
@@ -833,7 +946,8 @@ def update_graph_marker(n_intervals, current_time, video_info, eventfulness_data
             volume_bars.append(bar)
     
     # Return the updated figure and indicators
-    return updated_figure, False, debug_info, next_peak_time_display, peak_value_display, volume_bars
+    # Keep the intervals enabled only when the video is playing
+    return updated_figure, not playing, not playing, debug_info, next_peak_time_display, peak_value_display, volume_bars
 
 # Add a route for serving videos
 @server.route('/video')
@@ -861,6 +975,251 @@ def serve_video():
 def download_log():
     from flask import send_file
     return send_file(log_file, as_attachment=True)
+
+# Add route for serving extracted frames
+@server.route('/frame/<path:frame_path>')
+def serve_frame(frame_path):
+    from flask import send_file, Response
+    
+    # For security, ensure the path is within the RESULTS_DIR
+    full_path = os.path.join(RESULTS_DIR, frame_path)
+    if not os.path.exists(full_path):
+        return Response("Frame not found", status=404)
+    
+    return send_file(full_path)
+
+# Callback to update sliding window frames using the high-frequency interval
+@callback(
+    Output('sliding-window-container', 'children', allow_duplicate=True),
+    Input('sliding-window-update-interval', 'n_intervals'),
+    Input('video-player', 'currentTime'),
+    State('video-info', 'data'),
+    State('peak-frames', 'data'),
+    prevent_initial_call=True
+)
+def update_sliding_window(n_intervals, current_time, video_info, peak_frames):
+    # Add more detailed check for current_time
+    if current_time is None or not isinstance(current_time, (int, float)) or not video_info:
+        return html.Div("No preview available")
+    
+    # Check if peak frames are available
+    if not peak_frames or len(peak_frames) == 0:
+        return html.Div("No peak frames available for preview")
+    
+    # Only log every 10th update to reduce logging overhead
+    if n_intervals % 10 == 0:
+        timestamp = datetime.datetime.now().strftime("%H:%M:%S.%f")[:-3]
+        logger.info(f"[{timestamp}] Updating sliding window at time: {current_time:.3f}s")
+    
+    # Get video properties
+    duration = video_info['duration']
+    
+    # Calculate dynamic preview time based on video length and peak count
+    # Default to 3 seconds if calculation fails
+    preview_time = 3.0
+    
+    # Use the actual number of detected peaks
+    num_peaks = len(peak_frames)
+    # Calculate average time between peaks
+    avg_time_between_peaks = duration / num_peaks
+    # Use a fraction of this time as preview window (adjust as needed)
+    preview_time = min(max(avg_time_between_peaks * 0.8, 0.01), 5.0)
+    
+    # Only log preview time calculation occasionally to reduce overhead
+    if n_intervals % 30 == 0:
+        logger.info(f"Dynamic preview time: {preview_time:.2f}s (based on {num_peaks} peaks in {duration:.2f}s video)")
+    
+    # Use a more efficient approach to find relevant frames with list comprehension
+    relevant_frames = [
+        {
+            'frame': frame_data,
+            'time_diff': frame_data['time'] - current_time,
+            'peak_idx': peak_idx
+        }
+        for peak_idx, frame_data in peak_frames.items()
+        if -0.3 <= (frame_data['time'] - current_time) <= preview_time
+    ]
+    
+    # Sort frames by time difference (past to future)
+    relevant_frames.sort(key=lambda x: x['time_diff'])
+    
+    # Only log frame count occasionally
+    if n_intervals % 10 == 0:
+        logger.info(f"Found {len(relevant_frames)} relevant peak frames in time window")
+    
+    # Create frame elements for display
+    frame_elements = []
+    
+    # Add frames with positions based on time difference
+    for i, frame_data in enumerate(relevant_frames):
+        frame = frame_data['frame']
+        time_diff = frame_data['time_diff']
+        peak_idx = frame_data['peak_idx']
+        
+        # Get the relative path for the frame image
+        frame_path = frame['path']
+        rel_path = os.path.relpath(frame_path, RESULTS_DIR)
+        frame_url = f"/frame/{rel_path}"
+        
+        # Get peak value for labeling
+        peak_value = frame['peak_value']
+        
+        # Initialize skip_frame flag
+        skip_frame = False
+        
+        # Determine frame state and styling based on time difference
+        if time_diff < -0.2:
+            # Frame is well past - don't show it
+            skip_frame = True
+            position_percent = 50
+            opacity = 0
+            z_index = 1000 - int(time_diff * 100)  # Consistent z-index calculation
+            animation = ""
+            label = ""
+            label_style = {}
+        
+        elif time_diff < 0:
+            # Frame is just past - still at center
+            position_percent = 50
+            opacity = max(0.5, 1 + (time_diff * 2))  # Gradually reduce opacity
+            z_index = 1000 - int(time_diff * 100)  # Consistent z-index calculation
+            animation = "current"
+            label = "NOW"
+            label_style = {
+                'position': 'absolute',
+                'bottom': '5px',
+                'left': '5px',
+                'backgroundColor': 'rgba(255,69,0,0.7)',
+                'color': 'white',
+                'padding': '2px 5px',
+                'borderRadius': '3px',
+                'fontSize': '0.8em'
+            }
+        elif time_diff < 0.1:  # Current frame
+            # Frame is at current time - show at center
+            position_percent = 50
+            opacity = 1.0
+            z_index = 1000 - int(time_diff * 100)  # Consistent z-index calculation
+            animation = "current"
+            label = "NOW"
+            label_style = {
+                'position': 'absolute',
+                'bottom': '5px',
+                'left': '5px',
+                'backgroundColor': 'rgba(255,69,0,0.7)',
+                'color': 'white',
+                'padding': '2px 5px',
+                'borderRadius': '3px',
+                'fontSize': '0.8em'
+            }
+
+        else:
+            # Frame is in the future - use linear positioning from right to center
+            # Calculate position based on a constant speed approach
+            # All frames start at 90% (right side) and move toward 50% (center)
+            # The closer to current time, the closer to center
+            
+            # Linear mapping from time_diff to position with better spacing
+            # preview_time -> 90% (far right)
+            # 0s -> 50% (center)
+            # Ensure frames are spaced out more evenly
+            position_percent = 90 - ((preview_time - time_diff) / preview_time) * 40
+            
+            # Add some spacing based on the frame's position in the sequence
+            # This helps prevent frames from overlapping
+            # position_percent = position_percent + (i * 2)
+            
+            # Simple opacity - consistent for all future frames
+            opacity = 0.8
+            # Assign z-index based solely on time difference (closer to current time = higher z-index)
+            # This ensures each frame has a unique z-index independent of other frames
+            z_index = 1000 - int(time_diff * 100)  # Higher for frames closer to current time
+            animation = ""
+            label = f"+{time_diff:.1f}s"
+            label_style = {
+                'position': 'absolute',
+                'bottom': '5px',
+                'left': '5px',
+                'backgroundColor': 'rgba(0,0,0,0.7)',
+                'color': 'white',
+                'padding': '2px 5px',
+                'borderRadius': '3px',
+                'fontSize': '0.8em'
+            }
+        
+        # Skip frames that are too far past
+        if not skip_frame:
+            # Create the frame element with peak value indicator
+            frame_element = html.Div([
+                html.Img(src=frame_url),
+                html.Div(label, style=label_style),
+                html.Div(
+                    f"{peak_value:.2f}", 
+                    style={
+                        'position': 'absolute',
+                        'top': '5px',
+                        'right': '5px',
+                        'backgroundColor': 'rgba(0,0,0,0.6)',
+                        'color': 'white',
+                        'padding': '2px 5px',
+                        'borderRadius': '3px',
+                        'fontSize': '0.8em'
+                    }
+                )
+            ], className=f"sliding-window-frame {animation}", 
+               key=f"peak-{peak_idx}-{frame['time']}", 
+               style={
+                   'left': f"{position_percent}%",
+                   'opacity': opacity,
+                   'zIndex': z_index
+               })
+            
+            frame_elements.append(frame_element)
+    
+    # If no frames are available, show a message
+    if not frame_elements:
+        return html.Div("No upcoming peak frames in preview window")
+    
+    logger.info(f"[{timestamp}] Updated sliding window with {len(frame_elements)} peak frames")
+    return frame_elements
+
+# Callback to update peak frames gallery
+@callback(
+    Output('peak-frames-gallery', 'children'),
+    Input('peak-frames', 'data')
+)
+def update_peak_frames_gallery(peak_frames):
+    if not peak_frames:
+        return html.Div("No peak frames extracted yet.")
+    
+    # Create a gallery of frame thumbnails
+    frame_elements = []
+    
+    # Sort peaks by their index
+    sorted_peaks = sorted(peak_frames.keys(), key=lambda x: int(x))
+    
+    for peak_idx in sorted_peaks:
+        frame_info = peak_frames[peak_idx]
+        frame_path = frame_info['path']
+        peak_value = frame_info['peak_value']
+        time = frame_info['time']
+        
+        # Get relative path for URL
+        rel_path = os.path.relpath(frame_path, RESULTS_DIR)
+        frame_url = f"/frame/{rel_path}"
+        
+        # Create a thumbnail with info
+        thumbnail = html.Div([
+            html.Img(src=frame_url, style={'width': '150px', 'height': 'auto', 'objectFit': 'cover'}),
+            html.Div([
+                html.Div(f"Peak: {peak_value:.3f}", style={'fontSize': '0.8em'}),
+                html.Div(f"Time: {time:.2f}s", style={'fontSize': '0.8em'}),
+            ], style={'textAlign': 'center', 'marginTop': '5px'})
+        ], style={'border': '1px solid #ddd', 'padding': '5px', 'borderRadius': '5px'})
+        
+        frame_elements.append(thumbnail)
+    
+    return frame_elements
 
 # Callback to clear the log file
 @callback(
@@ -925,10 +1284,163 @@ def detect_local_maxima(data):
     """
     
     # Find peaks using scipy's find_peaks
-    peaks, properties = find_peaks(data, height = 0.3, distance = 5)
+    peaks, properties = find_peaks(data, height = 0.3, distance = 10)
     
     # Convert to list of integers
     return [int(peak) for peak in peaks]
+
+def extract_frames_at_peaks(video_path, peaks, video_info, eventfulness_data):
+    """
+    Extracts frames from the video at peak locations.
+    
+    Args:
+        video_path: Path to the video file
+        peaks: List of peak indices in eventfulness data
+        video_info: Dictionary containing video information
+        eventfulness_data: Dictionary containing eventfulness data
+        
+    Returns:
+        Dictionary mapping peak indices to extracted frame paths
+    """
+    import cv2
+    import os
+    from datetime import datetime
+    
+    # Create directory for extracted frames if it doesn't exist
+    video_filename = os.path.basename(video_path).split('.')[0]
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    frames_dir = os.path.join(RESULTS_DIR, f"peak_frames_{video_filename}_{timestamp}")
+    os.makedirs(frames_dir, exist_ok=True)
+    
+    # Open the video
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        logger.error(f"Failed to open video: {video_path}")
+        return {}
+    
+    # Get video properties
+    fps = video_info['fps']
+    frame_count = video_info['frame_count']
+    
+    # Dictionary to store peak index to frame path mapping
+    peak_frames = {}
+    
+    # Extract frames at each peak
+    for i, peak_idx in enumerate(peaks):
+        # Map peak index in eventfulness data to frame number in video
+        # This is the reverse of map_frame_to_datapoint
+        eventfulness_length = len(eventfulness_data['data'])
+        ratio = frame_count / eventfulness_length
+        frame_number = int(peak_idx * ratio)
+        
+        # Set video position to the frame
+        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_number)
+        
+        # Read the frame
+        ret, frame = cap.read()
+        if ret:
+            # Save the frame
+            frame_path = os.path.join(frames_dir, f"peak_{i}_idx_{peak_idx}_frame_{frame_number}.jpg")
+            cv2.imwrite(frame_path, frame)
+            
+            # Store the mapping
+            peak_frames[peak_idx] = {
+                'path': frame_path,
+                'frame_number': frame_number,
+                'peak_value': eventfulness_data['data'][peak_idx],
+                'time': frame_number / fps
+            }
+            
+            logger.info(f"Extracted frame at peak {i}: index={peak_idx}, frame={frame_number}, time={frame_number/fps:.2f}s")
+        else:
+            logger.error(f"Failed to extract frame at peak {i}: index={peak_idx}, frame={frame_number}")
+    
+    # Release the video
+    cap.release()
+    
+    logger.info(f"Extracted {len(peak_frames)} frames to {frames_dir}")
+    return peak_frames
+
+def extract_frames_for_sliding_window(video_path, video_info, interval_seconds=0.5, window_seconds=3):
+    """
+    Extracts frames at regular intervals throughout the video for the sliding window preview.
+    
+    Args:
+        video_path: Path to the video file
+        video_info: Dictionary containing video information
+        interval_seconds: Time interval between frames in seconds
+        window_seconds: Total window size in seconds
+        
+    Returns:
+        List of dictionaries with frame information
+    """
+    import cv2
+    import os
+    from datetime import datetime
+    
+    # Create directory for sliding window frames if it doesn't exist
+    video_filename = os.path.basename(video_path).split('.')[0]
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    frames_dir = os.path.join(RESULTS_DIR, f"sliding_window_{video_filename}_{timestamp}")
+    os.makedirs(frames_dir, exist_ok=True)
+    
+    # Open the video
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        logger.error(f"Failed to open video: {video_path}")
+        return []
+    
+    # Get video properties
+    fps = video_info['fps']
+    frame_count = video_info['frame_count']
+    duration = video_info['duration']
+    
+    # Calculate frame interval in frames
+    frame_interval = max(1, int(fps * interval_seconds))
+    
+    # List to store frame information
+    frames = []
+    
+    # Extract frames at regular intervals throughout the entire video
+    frame_number = 0
+    frame_index = 0
+    
+    while frame_number < frame_count:
+        # Set video position to the frame
+        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_number)
+        
+        # Read the frame
+        ret, frame = cap.read()
+        if ret:
+            # Calculate time in seconds for this frame
+            time_seconds = frame_number / fps
+            
+            # Save the frame
+            frame_path = os.path.join(frames_dir, f"window_frame_{frame_index}_time_{time_seconds:.2f}.jpg")
+            cv2.imwrite(frame_path, frame)
+            
+            # Store the frame information
+            frames.append({
+                'path': frame_path,
+                'frame_number': frame_number,
+                'time': time_seconds
+            })
+            
+            if frame_index % 20 == 0:  # Log every 20th frame to avoid log flooding
+                logger.info(f"Extracted sliding window frame {frame_index}: time={time_seconds:.2f}s, frame={frame_number}")
+            
+            frame_index += 1
+        else:
+            logger.error(f"Failed to extract sliding window frame at time={frame_number/fps:.2f}s, frame={frame_number}")
+        
+        # Move to next frame position
+        frame_number += frame_interval
+    
+    # Release the video
+    cap.release()
+    
+    logger.info(f"Extracted {len(frames)} sliding window frames to {frames_dir}")
+    return frames
 
 # Function to find the next upcoming local maximum
 def find_next_maximum(data, current_index, peaks):
