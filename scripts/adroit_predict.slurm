@@ -51,8 +51,9 @@ cd ~/Mirror2/scripts
 
 # Run prediction script
 # Data structure expected: data_dir/val/category_name/video_files.mp4
+
 python predict.py --data_dir /scratch/network/is1893/mirror2_data/dataSets/test_data \
-    --ngpu 1 --nepoch 1 --nworker 4 \
+    --ngpu 2 --nepoch 1 --nworker 4 \
     --label_type none \
     --num_accS_dir 4 --num_velS_dir 4 --num_blurrs 4 \
     --prediction_window_step 24 \

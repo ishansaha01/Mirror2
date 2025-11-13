@@ -10,6 +10,7 @@ from pathlib import Path
 import base64
 import logging
 import datetime
+from scipy.signal import find_peaks
 
 # Set up logging
 log_file = "/home/is1893/Mirror2/dataSets/test_data/results/sync_debug.log"
@@ -121,6 +122,60 @@ def list_mp4_files(directory="/home/is1893/Mirror2/dataSets/test_data/val/"):
 app = dash.Dash(__name__, suppress_callback_exceptions=True)
 server = app.server
 
+# Define custom CSS for animations
+app.index_string = '''
+<!DOCTYPE html>
+<html>
+    <head>
+        {%metas%}
+        <title>{%title%}</title>
+        {%favicon%}
+        {%css%}
+        <style>
+            @keyframes pulse {
+                0% { transform: scale(1); }
+                50% { transform: scale(1.1); }
+                100% { transform: scale(1); }
+            }
+            
+            @keyframes blink {
+                0% { opacity: 1; }
+                50% { opacity: 0.5; }
+                100% { opacity: 1; }
+            }
+            
+            .pulse {
+                animation: pulse 1s infinite;
+            }
+            
+            .blink {
+                animation: blink 1s infinite;
+            }
+            
+            .volume-bar {
+                display: inline-block;
+                width: 8px;
+                margin-right: 2px;
+                border-radius: 2px;
+                background-color: #ddd;
+            }
+            
+            .volume-bar.active {
+                background-color: #2196F3;
+            }
+        </style>
+    </head>
+    <body>
+        {%app_entry%}
+        <footer>
+            {%config%}
+            {%scripts%}
+            {%renderer%}
+        </footer>
+    </body>
+</html>
+'''
+
 # Get default video info and eventfulness data
 default_video_path = DEFAULT_VIDEO
 default_config_path, default_config = find_matching_config(default_video_path)
@@ -164,6 +219,7 @@ app.layout = html.Div([
     dcc.Store(id='current-video', data=default_video_path),
     dcc.Store(id='video-info', data=default_video_info),
     dcc.Store(id='eventfulness-data', data=default_eventfulness_data),
+    dcc.Store(id='peak-data', data=None),  # Store for detected peaks and dance steps
     
     # Main layout with file browser and content area
     html.Div([
@@ -198,6 +254,22 @@ app.layout = html.Div([
                         config={'displayModeBar': False}
                     ),
                 ], id='graph-section', style={'display': 'none'}),
+                
+                # Local maxima indicator
+                html.Div([
+                    html.H3("Local Maxima Detection"),
+                    html.Div([
+                        html.Div([
+                            html.Div("Next Peak:", style={'fontWeight': 'bold', 'display': 'inline-block', 'marginRight': '10px'}),
+                            html.Div(id='next-peak-time', style={'display': 'inline-block', 'fontSize': '1.2em'})
+                        ]),
+                        html.Div([
+                            html.Div("Peak Value:", style={'fontWeight': 'bold', 'display': 'inline-block', 'marginRight': '10px'}),
+                            html.Div(id='peak-value', style={'display': 'inline-block', 'marginRight': '10px'}),
+                            html.Div(id='volume-indicator', style={'display': 'inline-block'})
+                        ]),
+                    ], style={'border': '1px solid #ddd', 'borderRadius': '5px', 'padding': '15px', 'backgroundColor': '#f9f9f9'})
+                ], id='dance-step-section', style={'display': 'none', 'marginTop': '20px'}),
             ]),
         ], style={'width': '75%', 'float': 'left', 'padding': '10px'}),
     ], style={'display': 'flex', 'flexFlow': 'row'}),
@@ -358,11 +430,12 @@ def update_video_info_display(video_path, video_info, eventfulness_data):
 @callback(
     Output('video-player-container', 'children'),
     Output('video-section', 'style'),
+    Output('dance-step-section', 'style'),  # Also show the dance step section
     Input('current-video', 'data')
 )
 def update_video_player(video_path):
     if not video_path or not os.path.exists(video_path):
-        return dash.no_update, {'display': 'none'}
+        return dash.no_update, {'display': 'none'}, {'display': 'none'}
     
     # Create a data URL for the video
     video_url = f"/video?path={base64.b64encode(video_path.encode()).decode()}"
@@ -378,7 +451,7 @@ def update_video_player(video_path):
         playing=False
     )
     
-    return player, {'display': 'block'}
+    return player, {'display': 'block'}, {'display': 'block'}
 
 # Callback to update eventfulness graph
 @callback(
@@ -402,9 +475,21 @@ def update_eventfulness_graph(eventfulness_data, video_info, current_video):
     initial_index = 0
     initial_value = data[0] if len(data) > 0 else 0
     
-    # Log the initial graph setup
+    # Detect local maxima (peaks) in the eventfulness data
+    peaks = detect_local_maxima(data)
+    peak_values = [data[p] for p in peaks]
+    
+    # We're only focusing on local maxima now
+    
+    # Find the next upcoming peak
+    next_peak, distance_to_peak, next_peak_value = find_next_maximum(data, initial_index, peaks)
+    
+    # Log the initial graph setup and peak detection
     logger.info(f"Creating eventfulness graph with {len(data)} data points")
     logger.info(f"Initial marker position: index={initial_index}, value={initial_value:.3f}")
+    logger.info(f"Detected {len(peaks)} peaks")
+    if next_peak is not None:
+        logger.info(f"Next peak at index {next_peak}, distance: {distance_to_peak}, value: {next_peak_value:.3f}")
     
     # Create the base graph
     fig = go.Figure()
@@ -423,7 +508,21 @@ def update_eventfulness_graph(eventfulness_data, video_info, current_video):
         hoverlabel=dict(bgcolor='white')
     ))
     
-    # Add a vertical line for current position (trace index 1)
+    # Add markers for all peaks (trace index 1)
+    fig.add_trace(go.Scatter(
+        x=peaks,
+        y=peak_values,
+        mode='markers',
+        name='Peaks',
+        marker=dict(color='green', size=8, symbol='circle'),
+        hoverinfo='text',
+        hovertext=[f"Peak: {val:.3f}" for val in peak_values],
+        visible=True
+    ))
+    
+    # We're only showing local maxima now
+    
+    # Add a vertical line for current position (trace index 3)
     fig.add_trace(go.Scatter(
         x=[initial_index, initial_index],
         y=[min(data), max(data)],
@@ -434,7 +533,7 @@ def update_eventfulness_graph(eventfulness_data, video_info, current_video):
         visible=True
     ))
     
-    # Add a point marker for the current value (trace index 2)
+    # Add a point marker for the current value (trace index 4)
     fig.add_trace(go.Scatter(
         x=[initial_index],
         y=[initial_value],
@@ -446,6 +545,21 @@ def update_eventfulness_graph(eventfulness_data, video_info, current_video):
         hoverinfo='text',
         visible=True
     ))
+    
+    # Add a marker for the next upcoming peak (trace index 5)
+    if next_peak is not None:
+        fig.add_trace(go.Scatter(
+            x=[next_peak],
+            y=[next_peak_value],
+            mode='markers+text',
+            name='Next Peak',
+            marker=dict(color='orange', size=12, symbol='diamond'),
+            text=[f"Next: {next_peak_value:.3f}"],
+            textposition="top center",
+            hoverinfo='text',
+            hovertext=[f"Next peak: {next_peak_value:.3f}, Distance: {distance_to_peak}"],
+            visible=True
+        ))
     
     # Set up the layout
     fig.update_layout(
@@ -465,7 +579,7 @@ def update_eventfulness_graph(eventfulness_data, video_info, current_video):
             showticklabels=True,
         ),
         margin=dict(l=40, r=40, t=40, b=40),
-        showlegend=False,
+        showlegend=True,
         hovermode='closest',
         plot_bgcolor='white',
         uirevision='constant'  # Keep zoom level on updates
@@ -554,6 +668,9 @@ def log_video_events(playing, current_time, seek_to, current_debug):
     Output('eventfulness-graph', 'figure', allow_duplicate=True),
     Output('graph-update-interval', 'disabled'),
     Output('debug-info', 'children'),
+    Output('next-peak-time', 'children'),
+    Output('peak-value', 'children'),
+    Output('volume-indicator', 'children'),
     Input('graph-update-interval', 'n_intervals'),
     Input('video-player', 'currentTime'),
     State('video-info', 'data'),
@@ -573,7 +690,7 @@ def update_graph_marker(n_intervals, current_time, video_info, eventfulness_data
         # Update debug info
         debug_lines = current_debug.split('\n') if current_debug else []
         debug_lines = [log_msg] + debug_lines[:19]
-        return dash.no_update, True, '\n'.join(debug_lines)
+        return dash.no_update, True, '\n'.join(debug_lines), "N/A", "N/A", []
     
     # Calculate the current frame
     fps = video_info['fps']
@@ -588,6 +705,12 @@ def update_graph_marker(n_intervals, current_time, video_info, eventfulness_data
         current_value = data[data_index]
     else:
         current_value = 0
+    
+    # Detect local maxima (peaks) in the eventfulness data
+    peaks = detect_local_maxima(data)
+    
+    # Find the next upcoming peak
+    next_peak, distance_to_peak, next_peak_value = find_next_maximum(data, data_index, peaks)
     
     # Calculate the window range (1 second before, 3 seconds after)
     # Convert seconds to data points
@@ -607,23 +730,59 @@ def update_graph_marker(n_intervals, current_time, video_info, eventfulness_data
     # Update x-axis range to show the window
     updated_figure['layout']['xaxis']['range'] = [window_start, window_end]
     
-    # Update the vertical line (trace index 1)
+    # Update the markers for peaks (trace index 1)
     if len(updated_figure['data']) > 1:
-        updated_figure['data'][1]['x'] = [data_index, data_index]
-        updated_figure['data'][1]['y'] = [min(data), max(data)]
+        peak_values = [data[p] for p in peaks]
+        updated_figure['data'][1]['x'] = peaks
+        updated_figure['data'][1]['y'] = peak_values
+        updated_figure['data'][1]['hovertext'] = [f"Peak: {val:.3f}" for val in peak_values]
     
-    # Update the marker point (trace index 2)
+    # Update the vertical line for current position (trace index 2)
     if len(updated_figure['data']) > 2:
-        updated_figure['data'][2]['x'] = [data_index]
-        updated_figure['data'][2]['y'] = [current_value]
-        updated_figure['data'][2]['text'] = [f"{current_value:.3f}"]
+        updated_figure['data'][2]['x'] = [data_index, data_index]
+        updated_figure['data'][2]['y'] = [min(data), max(data)]
+    
+    # Update the marker point for current value (trace index 3)
+    if len(updated_figure['data']) > 3:
+        updated_figure['data'][3]['x'] = [data_index]
+        updated_figure['data'][3]['y'] = [current_value]
+        updated_figure['data'][3]['text'] = [f"{current_value:.3f}"]
+    
+    # Update the next peak marker (trace index 4)
+    if len(updated_figure['data']) > 4 and next_peak is not None:
+        # Calculate time to next peak in seconds
+        time_to_peak = distance_to_peak / points_per_second
+        
+        # Update the marker for the next peak
+        updated_figure['data'][4]['x'] = [next_peak]
+        updated_figure['data'][4]['y'] = [next_peak_value]
+        
+        # Update the marker text to show time until next peak
+        peak_text = f"Next: {time_to_peak:.1f}s"
+        
+        # Set marker style
+        updated_figure['data'][4]['marker'] = dict(
+            color='orange', 
+            size=12, 
+            symbol='diamond'
+        )
+            
+        updated_figure['data'][4]['text'] = [peak_text]
+        updated_figure['data'][4]['hovertext'] = [f"Next peak: {next_peak_value:.3f}, Time: {time_to_peak:.2f}s"]
+        updated_figure['data'][4]['visible'] = True
     
     # Verify that the marker was updated correctly
     is_valid = verify_marker_position(updated_figure, data_index, current_value)
     
     # Log the synchronization data with marker position and window info
     timestamp = datetime.datetime.now().strftime("%H:%M:%S.%f")[:-3]
-    log_msg = f"[{timestamp}] Time: {current_time:.3f}s, Frame: {current_frame}, Data idx: {data_index}, Value: {current_value:.3f}, Window: [{window_start}-{window_end}], Valid: {is_valid}"
+    log_msg = f"[{timestamp}] Time: {current_time:.3f}s, Frame: {current_frame}, Data idx: {data_index}, Value: {current_value:.3f}, Window: [{window_start}-{window_end}]"
+    
+    # Add information about the next peak
+    if next_peak is not None:
+        time_to_peak = distance_to_peak / points_per_second
+        log_msg += f", Next peak: {time_to_peak:.2f}s (value: {next_peak_value:.3f})"
+    
     logger.info(log_msg)
     
     # Update debug info (keep last 20 lines)
@@ -631,8 +790,50 @@ def update_graph_marker(n_intervals, current_time, video_info, eventfulness_data
     debug_lines = [log_msg] + debug_lines[:19]  # Add new line at the top, keep only last 20
     debug_info = '\n'.join(debug_lines)
     
-    # Return the updated figure
-    return updated_figure, False, debug_info
+    # Prepare peak indicator values
+    next_peak_time_display = "N/A"
+    peak_value_display = "N/A"
+    
+    if next_peak is not None:
+        # Calculate time to next peak in seconds
+        time_to_peak = distance_to_peak / points_per_second
+        
+        # Format the time display
+        if time_to_peak < 1.0:
+            next_peak_time_display = f"{time_to_peak:.2f} seconds"
+        else:
+            next_peak_time_display = f"{time_to_peak:.1f} seconds"
+        
+        # Format the peak value display
+        peak_value_display = f"{next_peak_value:.3f}"
+    
+    # Create volume indicator bars
+    volume_bars = []
+    if next_peak is not None:
+        # Create 10 volume bars
+        num_bars = 10
+        # Calculate how many bars should be active based on the peak value (0-1 scale)
+        active_bars = min(num_bars, max(1, int(next_peak_value * num_bars)))
+        
+        for i in range(num_bars):
+            bar_height = 10 + (i * 2)  # Increasing heights: 10px, 12px, 14px, etc.
+            
+            # Determine bar class
+            if i < active_bars:
+                bar_class = "volume-bar active"
+            else:
+                bar_class = "volume-bar"
+            
+            # Create the bar element
+            bar = html.Div(
+                "",
+                className=bar_class,
+                style={'height': f'{bar_height}px'}
+            )
+            volume_bars.append(bar)
+    
+    # Return the updated figure and indicators
+    return updated_figure, False, debug_info, next_peak_time_display, peak_value_display, volume_bars
 
 # Add a route for serving videos
 @server.route('/video')
@@ -710,6 +911,59 @@ def check_dash_player():
 dash_player_info = check_dash_player()
 logger.info(f"dash_player version: {dash_player_info['version']}")
 logger.info(f"dash_player props: {dash_player_info.get('props', [])}")
+
+# Function to detect local maxima in eventfulness data
+def detect_local_maxima(data):
+    """
+    Detects local maxima in eventfulness data.
+    
+    Args:
+        data: List of eventfulness values
+        
+    Returns:
+        List of indices where local maxima occur
+    """
+    
+    # Find peaks using scipy's find_peaks
+    peaks, properties = find_peaks(data, height = 0.3, distance = 5)
+    
+    # Convert to list of integers
+    return [int(peak) for peak in peaks]
+
+# Function to find the next upcoming local maximum
+def find_next_maximum(data, current_index, peaks):
+    """
+    Finds the next upcoming local maximum after the current position.
+    
+    Args:
+        data: List of eventfulness values
+        current_index: Current position in the data
+        peaks: List of peak indices
+        
+    Returns:
+        Tuple of (next_peak_index, distance_to_peak, peak_value)
+        If no upcoming peak is found, returns (None, None, None)
+    """
+    if not peaks:
+        return None, None, None
+    
+    # Find the first peak that is after the current position
+    upcoming_peaks = [p for p in peaks if p > current_index]
+    
+    if not upcoming_peaks:
+        # No upcoming peaks, wrap around to the first peak
+        next_peak = peaks[0]
+        distance = (len(data) - current_index) + next_peak
+    else:
+        next_peak = upcoming_peaks[0]
+        distance = next_peak - current_index
+    
+    # Get the peak value
+    peak_value = data[next_peak]
+    
+    return next_peak, distance, peak_value
+
+# Note: Simplified implementation to focus only on local maxima
 
 # Function to verify marker updates
 def verify_marker_position(figure, expected_position, expected_value):
