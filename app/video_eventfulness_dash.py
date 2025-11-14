@@ -1023,7 +1023,7 @@ def update_sliding_window(n_intervals, current_time, video_info, peak_frames):
     # Calculate average time between peaks
     avg_time_between_peaks = duration / num_peaks
     # Use a fraction of this time as preview window (adjust as needed)
-    preview_time = min(max(avg_time_between_peaks * 0.8, 0.01), 5.0)
+    preview_time = min(max(avg_time_between_peaks * 2, 0.01), 5.0)
     
     # Only log preview time calculation occasionally to reduce overhead
     if n_intervals % 30 == 0:
@@ -1284,7 +1284,7 @@ def detect_local_maxima(data):
     """
     
     # Find peaks using scipy's find_peaks
-    peaks, properties = find_peaks(data, height = 0.3, distance = 10)
+    peaks, properties = find_peaks(data, height = 0.3, distance = 5)
     
     # Convert to list of integers
     return [int(peak) for peak in peaks]
