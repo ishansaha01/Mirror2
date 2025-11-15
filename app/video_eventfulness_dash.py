@@ -14,6 +14,9 @@ from scipy.signal import find_peaks
 from sklearn.cluster import KMeans, DBSCAN, AgglomerativeClustering
 from sklearn.preprocessing import StandardScaler
 from sklearn.manifold import TSNE
+from sklearn.decomposition import PCA
+from sklearn.metrics import silhouette_score
+import mediapipe as mp
 
 # Set up logging
 log_file = "/home/is1893/Mirror2/dataSets/test_data/results/sync_debug.log"
@@ -273,6 +276,7 @@ app.layout = html.Div([
     dcc.Store(id='peak-frames', data=None),  # Store for extracted frames at peaks
     dcc.Store(id='sliding-window-frames', data=None),  # Store for sliding window frames
     dcc.Store(id='cluster-assignments', data=None),  # Store for cluster assignments
+    dcc.Store(id='pca-results', data=None),  # Store for PCA analysis results
     
     # Main layout with file browser and content area
     html.Div([
@@ -361,48 +365,95 @@ app.layout = html.Div([
                                 'borderRadius': '4px',
                                 'cursor': 'pointer'
                             }),
+                            html.Div([
+                                dcc.RadioItems(
+                                    id='frame-view-toggle',
+                                    options=[
+                                        {'label': 'Original Frames', 'value': 'original'},
+                                        {'label': 'Pose Annotated Frames', 'value': 'pose'}
+                                    ],
+                                    value='original',
+                                    labelStyle={'display': 'inline-block', 'marginRight': '15px'},
+                                    style={'marginLeft': '20px', 'display': 'inline-block'}
+                                ),
+                            ]),
                         ], style={'marginBottom': '10px'}),
                         html.Div([
-                            html.Label("Clustering Algorithm:", style={'marginRight': '10px'}),
+                            html.Label("Vector Type:", style={'marginRight': '10px'}),
                             dcc.Dropdown(
-                                id='cluster-algorithm',
+                                id='vector-type',
                                 options=[
-                                    {'label': 'K-Means', 'value': 'kmeans'},
-                                    {'label': 'DBSCAN', 'value': 'dbscan'},
-                                    {'label': 'Hierarchical', 'value': 'hierarchical'}
+                                    {'label': 'Eventfulness Vector', 'value': 'eventfulness'},
+                                    {'label': 'Pose Vector', 'value': 'pose'},
+                                    {'label': 'Combined Vectors', 'value': 'combined'}
                                 ],
-                                value='kmeans',
+                                value='eventfulness',
                                 style={'width': '200px', 'display': 'inline-block', 'marginRight': '20px'}
                             ),
-                            html.Label("Number of Clusters (K-Means/Hierarchical):", style={'marginRight': '10px'}),
+                            html.Label("Max Number of Clusters:", style={'marginRight': '10px'}),
                             dcc.Input(
-                                id='n-clusters',
+                                id='max-clusters',
                                 type='number',
-                                value=3,
+                                value=40,
                                 min=2,
-                                max=10,
+                                max=40,
                                 style={'width': '80px', 'display': 'inline-block', 'marginRight': '20px'}
-                            ),
-                            html.Label("Epsilon (DBSCAN):", style={'marginRight': '10px'}),
-                            dcc.Input(
-                                id='dbscan-eps',
-                                type='number',
-                                value=0.5,
-                                min=0.1,
-                                max=2.0,
-                                step=0.1,
-                                style={'width': '80px', 'display': 'inline-block'}
                             ),
                         ], id='cluster-controls', style={'marginBottom': '10px', 'display': 'block'}),
                         html.Div(id='cluster-info', style={'marginBottom': '10px', 'fontSize': '0.9em', 'color': '#666'}),
                         html.Div([
-                            html.H4("Cluster Visualization"),
+                            html.H4("K-Means Clustering Results"),
                             dcc.Graph(
                                 id='cluster-visualization',
                                 style={'height': '400px'},
                                 config={'displayModeBar': True}
                             ),
+                            html.H4("Silhouette Score Analysis", style={'marginTop': '20px'}),
+                            dcc.Graph(
+                                id='silhouette-plot',
+                                style={'height': '300px'},
+                                config={'displayModeBar': True}
+                            ),
                         ], id='cluster-viz-section', style={'display': 'none', 'marginBottom': '20px'}),
+                        
+                        # PCA Analysis Section
+                        html.Div([
+                            html.H4("PCA Analysis"),
+                            html.Div([
+                                html.Label("PCA Components:", style={'marginRight': '10px'}),
+                                html.Div([
+                                    dcc.Slider(
+                                        id='pca-components-slider',
+                                        min=2,
+                                        max=10,
+                                        step=1,
+                                        value=3,
+                                        marks={i: str(i) for i in range(2, 11)},
+                                        tooltip={"placement": "bottom", "always_visible": True}
+                                    )
+                                ], style={'width': '300px', 'display': 'inline-block', 'marginRight': '20px'}),
+                                html.Button("Run PCA Analysis", id='pca-button', n_clicks=0, style={
+                                    'marginLeft': '20px',
+                                    'padding': '8px 16px',
+                                    'backgroundColor': '#4CAF50',
+                                    'color': 'white',
+                                    'border': 'none',
+                                    'borderRadius': '4px',
+                                    'cursor': 'pointer'
+                                }),
+                            ], style={'marginBottom': '15px'}),
+                            html.Div(id='pca-info', style={'marginBottom': '10px', 'fontSize': '0.9em', 'color': '#666'}),
+                            dcc.Graph(
+                                id='pca-visualization',
+                                style={'height': '400px'},
+                                config={'displayModeBar': True}
+                            ),
+                            dcc.Graph(
+                                id='pca-variance-plot',
+                                style={'height': '300px'},
+                                config={'displayModeBar': True}
+                            ),
+                        ], id='pca-section', style={'display': 'none', 'marginBottom': '20px', 'marginTop': '20px', 'border': '1px solid #ddd', 'borderRadius': '5px', 'padding': '15px', 'backgroundColor': '#f9f9f9'}),
                         html.Div(id='peak-frames-gallery', style={'display': 'flex', 'flexWrap': 'wrap', 'gap': '10px'}),
                     ], style={'border': '1px solid #ddd', 'borderRadius': '5px', 'padding': '15px', 'backgroundColor': '#f9f9f9'})
                 ], id='peak-frames-section', style={'display': 'none', 'marginTop': '20px'}),
@@ -1250,14 +1301,13 @@ def update_sliding_window(n_intervals, current_time, video_info, peak_frames):
      Output('cluster-info', 'children'),
      Output('cluster-viz-section', 'style')],
     [Input('cluster-button', 'n_clicks'),
-     Input('cluster-algorithm', 'value')],
+     Input('vector-type', 'value')],
     [State('peak-frames', 'data'),
-     State('n-clusters', 'value'),
-     State('dbscan-eps', 'value'),
+     State('max-clusters', 'value'),
      State('cluster-assignments', 'data')],
     prevent_initial_call=True
 )
-def handle_clustering(n_clicks, algorithm, peak_frames, n_clusters, dbscan_eps, existing_assignments):
+def handle_clustering(n_clicks, vector_type, peak_frames, max_clusters, existing_assignments):
     ctx = dash.callback_context
     if not ctx.triggered:
         return {'display': 'none'}, existing_assignments, "", {'display': 'none'}
@@ -1269,29 +1319,53 @@ def handle_clustering(n_clicks, algorithm, peak_frames, n_clusters, dbscan_eps, 
         if not peak_frames:
             return {'display': 'block'}, existing_assignments, html.Div("No peak frames available for clustering.", style={'color': 'red'}), {'display': 'none'}
         
-        # Perform clustering
-        eps = dbscan_eps if dbscan_eps else 0.5
-        n_clust = n_clusters if n_clusters else 3
+        # Perform clustering with K-means and silhouette score analysis
+        max_k = max_clusters if max_clusters else 40
         
         cluster_assignments, cluster_info = cluster_eventfulness_vectors(
             peak_frames, 
-            algorithm=algorithm, 
-            n_clusters=n_clust, 
-            eps=eps
+            max_clusters=max_k,
+            vector_type=vector_type
         )
         
         if cluster_assignments is None:
             return {'display': 'block'}, existing_assignments, html.Div("Clustering failed. Check logs for details.", style={'color': 'red'}), {'display': 'none'}
         
-        # Create info display
-        info_text = f"Algorithm: {cluster_info['algorithm']}, Clusters: {cluster_info['n_clusters']}, Samples: {cluster_info['n_samples']}"
-        if 'n_noise' in cluster_info:
-            info_text += f", Noise points: {cluster_info['n_noise']}"
+        # Store silhouette score data in the cluster_assignments store for visualization
+        if 'k_values' in cluster_info and 'silhouette_scores' in cluster_info:
+            cluster_assignments['k_values_data'] = json.dumps(cluster_info['k_values'])
+            cluster_assignments['silhouette_scores_data'] = json.dumps(cluster_info['silhouette_scores'])
+            cluster_assignments['penalized_scores_data'] = json.dumps(cluster_info['penalized_scores'])
+            cluster_assignments['best_k_value'] = str(cluster_info['n_clusters'])
         
-        return {'display': 'block'}, cluster_assignments, html.Div(info_text, style={'color': '#2196F3', 'fontWeight': 'bold'}), {'display': 'block'}
+        # Create info display with silhouette score information
+        info_text = (
+            f"Vector Type: {cluster_info['vector_type'].capitalize()}, "
+            f"Optimal Clusters: {cluster_info['n_clusters']}, "
+            f"Silhouette Score: {cluster_info['silhouette_score']:.4f}, "
+            f"Samples: {cluster_info['n_samples']}"
+        )
+        
+        # Create a more detailed info display with silhouette scores
+        info_div = html.Div([
+            html.Div(info_text, style={'color': '#2196F3', 'fontWeight': 'bold', 'marginBottom': '10px'}),
+            html.Div("Silhouette scores by cluster count:", style={'fontSize': '0.9em', 'marginTop': '5px'}),
+            html.Div([
+                html.Span(f"K={k}: {score:.4f}", 
+                    style={
+                        'marginRight': '10px', 
+                        'fontWeight': 'bold' if k == cluster_info['n_clusters'] else 'normal',
+                        'color': '#2196F3' if k == cluster_info['n_clusters'] else 'inherit'
+                    }
+                ) 
+                for k, score in zip(cluster_info['k_values'], cluster_info['silhouette_scores'])
+            ], style={'fontSize': '0.9em'})
+        ])
+        
+        return {'display': 'block'}, cluster_assignments, info_div, {'display': 'block'}
     
-    # Show controls when algorithm changes (but don't re-cluster)
-    if trigger_id == 'cluster-algorithm':
+    # Show controls when vector type changes (but don't re-cluster)
+    if trigger_id == 'vector-type':
         viz_style = {'display': 'block'} if existing_assignments else {'display': 'none'}
         return {'display': 'block'}, existing_assignments, "", viz_style
     
@@ -1301,9 +1375,10 @@ def handle_clustering(n_clicks, algorithm, peak_frames, n_clusters, dbscan_eps, 
 @callback(
     Output('peak-frames-gallery', 'children'),
     [Input('peak-frames', 'data'),
-     Input('cluster-assignments', 'data')]
+     Input('cluster-assignments', 'data'),
+     Input('frame-view-toggle', 'value')]
 )
-def update_peak_frames_gallery(peak_frames, cluster_assignments):
+def update_peak_frames_gallery(peak_frames, cluster_assignments, frame_view):
     if not peak_frames:
         return html.Div("No peak frames extracted yet.")
     
@@ -1348,10 +1423,18 @@ def update_peak_frames_gallery(peak_frames, cluster_assignments):
     
     for peak_idx in sorted_peaks:
         frame_info = peak_frames[peak_idx]
-        frame_path = frame_info['path']
+        
+        # Choose which frame path to use based on toggle
+        if frame_view == 'pose' and 'annotated_path' in frame_info:
+            frame_path = frame_info['annotated_path']
+        else:
+            frame_path = frame_info['path']
+            
         peak_value = frame_info['peak_value']
         time = frame_info['time']
         eventfulness_vector = frame_info.get('eventfulness_vector', None)
+        pose_vector = frame_info.get('pose_vector', None)
+        pose_detected = frame_info.get('pose_detected', False)
         
         # Get cluster assignment if available
         cluster_id = None
@@ -1363,6 +1446,12 @@ def update_peak_frames_gallery(peak_frames, cluster_assignments):
         if eventfulness_vector:
             # Magnitude = ||v|| = sqrt(sum(v[i]^2))
             vector_magnitude = np.linalg.norm(eventfulness_vector)
+        
+        # Calculate magnitude of pose vector if available
+        pose_magnitude = None
+        if pose_vector:
+            # Magnitude = ||v|| = sqrt(sum(v[i]^2))
+            pose_magnitude = np.linalg.norm(pose_vector)
         
         # Get relative path for URL
         rel_path = os.path.relpath(frame_path, RESULTS_DIR)
@@ -1388,7 +1477,21 @@ def update_peak_frames_gallery(peak_frames, cluster_assignments):
         # Add magnitude if available
         if vector_magnitude is not None:
             info_divs.append(
-                html.Div(f"Magnitude: {vector_magnitude:.3f}", style={'fontSize': '0.8em', 'fontWeight': 'bold', 'color': '#2196F3'})
+                html.Div(f"Eventfulness Mag: {vector_magnitude:.3f}", style={'fontSize': '0.8em', 'fontWeight': 'bold', 'color': '#2196F3'})
+            )
+        
+        # Add pose information if available
+        if pose_detected:
+            info_divs.append(
+                html.Div(f"Pose Detected ✓", style={'fontSize': '0.8em', 'fontWeight': 'bold', 'color': 'green'})
+            )
+            if pose_magnitude is not None:
+                info_divs.append(
+                    html.Div(f"Pose Mag: {pose_magnitude:.3f}", style={'fontSize': '0.8em', 'color': 'green'})
+                )
+        else:
+            info_divs.append(
+                html.Div("No Pose Detected", style={'fontSize': '0.8em', 'color': 'red'})
             )
         
         # Add cluster assignment if available
@@ -1426,59 +1529,125 @@ def update_peak_frames_gallery(peak_frames, cluster_assignments):
     
     return frame_elements
 
-# Callback to create cluster visualization
+# Callback to create cluster visualization and silhouette plot
 @callback(
-    Output('cluster-visualization', 'figure'),
+    [Output('cluster-visualization', 'figure'),
+     Output('silhouette-plot', 'figure')],
     [Input('peak-frames', 'data'),
-     Input('cluster-assignments', 'data')]
+     Input('cluster-assignments', 'data'),
+     Input('vector-type', 'value')]
 )
-def update_cluster_visualization(peak_frames, cluster_assignments):
+def update_cluster_visualization(peak_frames, cluster_assignments, vector_type):
     if not peak_frames or not cluster_assignments:
-        # Return empty figure
-        fig = go.Figure()
-        fig.add_annotation(
+        # Return empty figures
+        empty_fig = go.Figure()
+        empty_fig.add_annotation(
             text="No clustering data available. Click 'Cluster Vectors' to perform clustering.",
             xref="paper", yref="paper",
             x=0.5, y=0.5, showarrow=False,
             font=dict(size=14, color="gray")
         )
-        fig.update_layout(
-            title="Cluster Visualization",
+        empty_fig.update_layout(
+            title="K-Means Clustering Visualization",
             xaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
             yaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
             plot_bgcolor='white'
         )
-        return fig
+        
+        empty_silhouette_fig = go.Figure()
+        empty_silhouette_fig.add_annotation(
+            text="Run clustering to see silhouette score analysis.",
+            xref="paper", yref="paper",
+            x=0.5, y=0.5, showarrow=False,
+            font=dict(size=14, color="gray")
+        )
+        empty_silhouette_fig.update_layout(
+            title="Silhouette Score Analysis",
+            xaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
+            yaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
+            plot_bgcolor='white'
+        )
+        
+        return empty_fig, empty_silhouette_fig
     
-    # Extract vectors and cluster assignments
+    # Extract vectors and cluster assignments based on vector_type
     vectors = []
     peak_indices = []
     cluster_labels = []
     
     for peak_idx, frame_info in peak_frames.items():
-        eventfulness_vector = frame_info.get('eventfulness_vector', None)
-        if eventfulness_vector is not None:
+        feature_vector = None
+        
+        if vector_type == 'eventfulness':
+            # Use eventfulness vector
+            feature_vector = frame_info.get('eventfulness_vector', None)
+            
+        elif vector_type == 'pose':
+            # Use pose vector
+            pose_vector = frame_info.get('pose_vector', None)
+            pose_detected = frame_info.get('pose_detected', False)
+            if pose_vector is not None and pose_detected:
+                feature_vector = pose_vector
+                
+        elif vector_type == 'combined':
+            # Use both vectors
+            eventfulness_vector = frame_info.get('eventfulness_vector', None)
+            pose_vector = frame_info.get('pose_vector', None)
+            pose_detected = frame_info.get('pose_detected', False)
+            
+            if eventfulness_vector is not None and pose_vector is not None and pose_detected:
+                # Normalize each vector separately before combining
+                if len(eventfulness_vector) > 0:
+                    e_norm = np.linalg.norm(eventfulness_vector)
+                    if e_norm > 0:
+                        eventfulness_vector = [x / e_norm for x in eventfulness_vector]
+                
+                if len(pose_vector) > 0:
+                    p_norm = np.linalg.norm(pose_vector)
+                    if p_norm > 0:
+                        pose_vector = [x / p_norm for x in pose_vector]
+                
+                # Combine the vectors
+                feature_vector = eventfulness_vector + pose_vector
+        
+        # Add vector if available and has cluster assignment
+        if feature_vector is not None:
             cluster_id = cluster_assignments.get(str(peak_idx), None)
             if cluster_id is not None:
-                vectors.append(eventfulness_vector)
+                vectors.append(feature_vector)
                 peak_indices.append(peak_idx)
                 cluster_labels.append(cluster_id)
     
     if len(vectors) < 2:
-        fig = go.Figure()
-        fig.add_annotation(
-            text="Not enough vectors for visualization (need at least 2).",
+        empty_fig = go.Figure()
+        empty_fig.add_annotation(
+            text=f"Not enough {vector_type} vectors for visualization (need at least 2).",
             xref="paper", yref="paper",
             x=0.5, y=0.5, showarrow=False,
             font=dict(size=14, color="gray")
         )
-        fig.update_layout(
-            title="Cluster Visualization",
+        empty_fig.update_layout(
+            title=f"K-Means Clustering - {vector_type.capitalize()} Vectors",
             xaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
             yaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
             plot_bgcolor='white'
         )
-        return fig
+        
+        empty_silhouette_fig = go.Figure()
+        empty_silhouette_fig.add_annotation(
+            text=f"Not enough {vector_type} vectors for silhouette analysis.",
+            xref="paper", yref="paper",
+            x=0.5, y=0.5, showarrow=False,
+            font=dict(size=14, color="gray")
+        )
+        empty_silhouette_fig.update_layout(
+            title="Silhouette Score Analysis",
+            xaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
+            yaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
+            plot_bgcolor='white'
+        )
+        
+        return empty_fig, empty_silhouette_fig
     
     # Convert to numpy array
     X = np.array(vectors)
@@ -1504,7 +1673,7 @@ def update_cluster_visualization(peak_frames, cluster_assignments):
         logger.error(f"Error in t-SNE: {str(e)}")
         # Fallback to PCA
         from sklearn.decomposition import PCA
-        pca = PCA(n_components=2)
+        pca = PCA(n_components=.99)
         X_2d = pca.fit_transform(X_scaled)
     
     # Define color palette for clusters
@@ -1544,12 +1713,28 @@ def update_cluster_visualization(peak_frames, cluster_assignments):
         for i in cluster_mask:
             peak_idx = peak_indices[i]
             frame_info = peak_frames[peak_idx]
-            hover_texts.append(
-                f"Peak Index: {peak_idx}<br>" +
-                f"Time: {frame_info['time']:.2f}s<br>" +
-                f"Peak Value: {frame_info['peak_value']:.3f}<br>" +
+            
+            # Add vector-specific information to hover text
+            hover_info = [
+                f"Peak Index: {peak_idx}",
+                f"Time: {frame_info['time']:.2f}s",
+                f"Peak Value: {frame_info['peak_value']:.3f}",
                 f"Cluster: {cluster_name}"
-            )
+            ]
+            
+            # Add vector magnitude information based on vector type
+            if vector_type == 'eventfulness' or vector_type == 'combined':
+                if 'eventfulness_vector' in frame_info and frame_info['eventfulness_vector'] is not None:
+                    e_mag = np.linalg.norm(frame_info['eventfulness_vector'])
+                    hover_info.append(f"Eventfulness Mag: {e_mag:.3f}")
+            
+            if vector_type == 'pose' or vector_type == 'combined':
+                if 'pose_vector' in frame_info and frame_info['pose_vector'] is not None:
+                    p_mag = np.linalg.norm(frame_info['pose_vector'])
+                    hover_info.append(f"Pose Mag: {p_mag:.3f}")
+                    hover_info.append(f"Pose Detected: {frame_info.get('pose_detected', False)}")
+            
+            hover_texts.append("<br>".join(hover_info))
         
         fig.add_trace(go.Scatter(
             x=x_coords,
@@ -1569,7 +1754,7 @@ def update_cluster_visualization(peak_frames, cluster_assignments):
     
     # Update layout
     fig.update_layout(
-        title="Cluster Visualization (t-SNE)",
+        title=f"K-Means Clustering - {vector_type.capitalize()} Vectors (t-SNE)",
         xaxis=dict(title="t-SNE Dimension 1", showgrid=True),
         yaxis=dict(title="t-SNE Dimension 2", showgrid=True),
         hovermode='closest',
@@ -1585,7 +1770,298 @@ def update_cluster_visualization(peak_frames, cluster_assignments):
         )
     )
     
-    return fig
+    # Create silhouette score plot if we have the data in the cluster_assignments store
+    silhouette_fig = go.Figure()
+    
+    # Try to extract silhouette scores from the cluster_assignments store
+    # This requires that we've used our new clustering approach
+    k_values = []
+    silhouette_scores = []
+    penalized_scores = []
+    best_k = None
+    
+    # Check if we have any silhouette score data stored in the cluster_assignments
+    if 'k_values_data' in cluster_assignments:
+        k_values = json.loads(cluster_assignments['k_values_data'])
+    if 'silhouette_scores_data' in cluster_assignments:
+        silhouette_scores = json.loads(cluster_assignments['silhouette_scores_data'])
+    if 'penalized_scores_data' in cluster_assignments:
+        penalized_scores = json.loads(cluster_assignments['penalized_scores_data'])
+    if 'best_k_value' in cluster_assignments:
+        best_k = int(cluster_assignments['best_k_value'])
+    
+    if k_values and silhouette_scores:
+        # Plot original silhouette scores
+        silhouette_fig.add_trace(go.Scatter(
+            x=k_values,
+            y=silhouette_scores,
+            mode='lines+markers',
+            name='Silhouette Scores',
+            line=dict(color='blue', width=2),
+            marker=dict(size=8)
+        ))
+        
+        # Plot penalized scores if available
+        if penalized_scores:
+            silhouette_fig.add_trace(go.Scatter(
+                x=k_values,
+                y=penalized_scores,
+                mode='lines+markers',
+                name='Penalized Scores',
+                line=dict(color='green', width=2, dash='dot'),
+                marker=dict(size=8)
+            ))
+        
+        # Highlight the chosen k value
+        if best_k is not None and best_k in k_values:
+            idx = k_values.index(best_k)
+            silhouette_fig.add_trace(go.Scatter(
+                x=[best_k],
+                y=[silhouette_scores[idx]],
+                mode='markers',
+                name=f'Selected k={best_k}',
+                marker=dict(color='red', size=12, symbol='star')
+            ))
+        
+        silhouette_fig.update_layout(
+            title="Silhouette Score Analysis for K Selection",
+            xaxis=dict(title="Number of Clusters (k)", tickmode='linear', dtick=1),
+            yaxis=dict(title="Silhouette Score"),
+            hovermode='closest',
+            plot_bgcolor='white',
+            width=800,
+            height=300,
+            legend=dict(
+                orientation="h",
+                yanchor="bottom",
+                y=1.02,
+                xanchor="right",
+                x=1
+            )
+        )
+    else:
+        # If we don't have silhouette data, create a placeholder
+        silhouette_fig.add_annotation(
+            text="Silhouette score data not available. Run clustering again to see analysis.",
+            xref="paper", yref="paper",
+            x=0.5, y=0.5, showarrow=False,
+            font=dict(size=14, color="gray")
+        )
+        silhouette_fig.update_layout(
+            title="Silhouette Score Analysis",
+            xaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
+            yaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
+            plot_bgcolor='white'
+        )
+    
+    return fig, silhouette_fig
+
+# Callback to handle PCA analysis button
+@callback(
+    [Output('pca-results', 'data'),
+     Output('pca-info', 'children'),
+     Output('pca-section', 'style'),
+     Output('pca-visualization', 'figure'),
+     Output('pca-variance-plot', 'figure')],
+    [Input('pca-button', 'n_clicks'),
+     Input('vector-type', 'value')],
+    [State('peak-frames', 'data'),
+     State('pca-components-slider', 'value')],
+    prevent_initial_call=True
+)
+def handle_pca_analysis(n_clicks, vector_type, peak_frames, n_components):
+    if not n_clicks or not peak_frames:
+        # Return empty figures
+        empty_fig = go.Figure()
+        empty_fig.add_annotation(
+            text="No PCA analysis performed yet. Click 'Run PCA Analysis' to begin.",
+            xref="paper", yref="paper",
+            x=0.5, y=0.5, showarrow=False,
+            font=dict(size=14, color="gray")
+        )
+        empty_fig.update_layout(
+            title="PCA Visualization",
+            xaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
+            yaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
+            plot_bgcolor='white'
+        )
+        
+        empty_variance_fig = go.Figure()
+        empty_variance_fig.update_layout(
+            title="Explained Variance",
+            xaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
+            yaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
+            plot_bgcolor='white'
+        )
+        
+        return None, "", {'display': 'none'}, empty_fig, empty_variance_fig
+    
+    # Extract vectors based on vector_type
+    vectors = []
+    peak_indices = []
+    
+    for peak_idx, frame_info in peak_frames.items():
+        feature_vector = None
+        
+        if vector_type == 'eventfulness':
+            # Use eventfulness vector
+            feature_vector = frame_info.get('eventfulness_vector', None)
+            
+        elif vector_type == 'pose':
+            # Use pose vector
+            pose_vector = frame_info.get('pose_vector', None)
+            pose_detected = frame_info.get('pose_detected', False)
+            if pose_vector is not None and pose_detected:
+                feature_vector = pose_vector
+                
+        elif vector_type == 'combined':
+            # Use both vectors
+            eventfulness_vector = frame_info.get('eventfulness_vector', None)
+            pose_vector = frame_info.get('pose_vector', None)
+            pose_detected = frame_info.get('pose_detected', False)
+            
+            if eventfulness_vector is not None and pose_vector is not None and pose_detected:
+                # Normalize each vector separately before combining
+                if len(eventfulness_vector) > 0:
+                    e_norm = np.linalg.norm(eventfulness_vector)
+                    if e_norm > 0:
+                        eventfulness_vector = [x / e_norm for x in eventfulness_vector]
+                
+                if len(pose_vector) > 0:
+                    p_norm = np.linalg.norm(pose_vector)
+                    if p_norm > 0:
+                        pose_vector = [x / p_norm for x in pose_vector]
+                
+                # Combine the vectors
+                feature_vector = eventfulness_vector + pose_vector
+        
+        # Add vector if available
+        if feature_vector is not None:
+            vectors.append(feature_vector)
+            peak_indices.append(peak_idx)
+    
+    if len(vectors) < 2:
+        # Not enough vectors for PCA
+        empty_fig = go.Figure()
+        empty_fig.add_annotation(
+            text=f"Not enough {vector_type} vectors for PCA analysis (need at least 2).",
+            xref="paper", yref="paper",
+            x=0.5, y=0.5, showarrow=False,
+            font=dict(size=14, color="gray")
+        )
+        empty_fig.update_layout(
+            title=f"PCA Analysis - {vector_type.capitalize()} Vectors",
+            xaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
+            yaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
+            plot_bgcolor='white'
+        )
+        
+        empty_variance_fig = go.Figure()
+        empty_variance_fig.update_layout(
+            title="Explained Variance",
+            xaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
+            yaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
+            plot_bgcolor='white'
+        )
+        
+        return None, html.Div(f"Not enough {vector_type} vectors for PCA analysis.", style={'color': 'red'}), {'display': 'block'}, empty_fig, empty_variance_fig
+    
+    # Perform PCA analysis
+    pca_results = perform_pca_analysis(vectors, n_components=n_components)
+    
+    if pca_results is None:
+        # PCA analysis failed
+        return None, html.Div("PCA analysis failed. Check logs for details.", style={'color': 'red'}), {'display': 'block'}, empty_fig, empty_variance_fig
+    
+    # Create info display
+    info_text = f"Vector Type: {vector_type.capitalize()}, Components: {pca_results['n_components']}, Total Explained Variance: {pca_results['total_explained_variance']:.4f}"
+    
+    # Create PCA visualization figure
+    pca_fig = go.Figure()
+    
+    # Get the first two PCA components
+    X_pca = pca_results['pca_vectors']
+    
+    # Create scatter plot of PCA components
+    for i, peak_idx in enumerate(peak_indices):
+        frame_info = peak_frames[peak_idx]
+        time = frame_info['time']
+        peak_value = frame_info['peak_value']
+        
+        # Create hover text
+        hover_text = f"Peak Index: {peak_idx}<br>Time: {time:.2f}s<br>Peak Value: {peak_value:.3f}"
+        
+        # Add point to scatter plot
+        pca_fig.add_trace(go.Scatter(
+            x=[X_pca[i, 0]],
+            y=[X_pca[i, 1]],
+            mode='markers+text',
+            name=f'Peak {peak_idx}',
+            text=[f"{i}"],
+            textposition="top center",
+            marker=dict(
+                size=10,
+                color=peak_value,
+                colorscale='Viridis',
+                showscale=True,
+                colorbar=dict(title="Peak Value")
+            ),
+            hovertext=hover_text,
+            hoverinfo='text',
+            showlegend=False
+        ))
+    
+    # Update layout
+    pca_fig.update_layout(
+        title=f"PCA of {vector_type.capitalize()} Vectors (First Two Components)",
+        xaxis=dict(title=f"PC1 ({pca_results['explained_variance_ratio'][0]:.2%} variance)"),
+        yaxis=dict(title=f"PC2 ({pca_results['explained_variance_ratio'][1]:.2%} variance)"),
+        hovermode='closest',
+        plot_bgcolor='white',
+        width=800,
+        height=500
+    )
+    
+    # Create explained variance plot
+    variance_fig = go.Figure()
+    
+    # Add cumulative explained variance
+    cumulative_variance = np.cumsum(pca_results['explained_variance_ratio'])
+    variance_fig.add_trace(go.Scatter(
+        x=list(range(1, len(cumulative_variance) + 1)),
+        y=cumulative_variance,
+        mode='lines+markers',
+        name='Cumulative Explained Variance',
+        line=dict(color='blue', width=2),
+        marker=dict(size=8)
+    ))
+    
+    # Add individual explained variance
+    variance_fig.add_trace(go.Bar(
+        x=list(range(1, len(pca_results['explained_variance_ratio']) + 1)),
+        y=pca_results['explained_variance_ratio'],
+        name='Individual Explained Variance',
+        marker_color='rgba(55, 83, 109, 0.7)'
+    ))
+    
+    # Update layout
+    variance_fig.update_layout(
+        title='Explained Variance by PCA Components',
+        xaxis=dict(title='Number of Components', tickmode='linear', dtick=1),
+        yaxis=dict(title='Explained Variance Ratio', range=[0, 1]),
+        hovermode='x',
+        legend=dict(
+            orientation="h",
+            yanchor="bottom",
+            y=1.02,
+            xanchor="right",
+            x=1
+        ),
+        plot_bgcolor='white'
+    )
+    
+    # Return results
+    return pca_results, html.Div(info_text, style={'color': '#4CAF50', 'fontWeight': 'bold'}), {'display': 'block'}, pca_fig, variance_fig
 
 # Callback to clear the log file
 @callback(
@@ -1600,6 +2076,48 @@ def clear_log(n_clicks):
             f.write(f"Log cleared at {datetime.datetime.now()}\n")
         logger.info("Log cleared by user")
     return 0
+
+# Function to perform PCA analysis on vectors
+def perform_pca_analysis(vectors, n_components=0.95):
+    """
+    Performs PCA analysis on a set of vectors.
+    
+    Args:
+        vectors: List of vectors to analyze
+        n_components: Number of components to keep (if float, represents variance to preserve)
+        
+    Returns:
+        Dictionary containing PCA results
+    """
+    if len(vectors) < 2:
+        logger.warning("Not enough vectors for PCA analysis (need at least 2)")
+        return None
+    
+    # Convert to numpy array
+    X = np.array(vectors)
+    
+    # Standardize the data
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X)
+    
+    # Apply PCA
+    pca = PCA(n_components=n_components)
+    X_pca = pca.fit_transform(X_scaled)
+    
+    # Create results dictionary
+    pca_results = {
+        'pca_vectors': X_pca,
+        'explained_variance_ratio': pca.explained_variance_ratio_,
+        'n_components': pca.n_components_,
+        'total_explained_variance': sum(pca.explained_variance_ratio_),
+        'scaler': scaler,
+        'pca': pca
+    }
+    
+    logger.info(f"PCA analysis completed: {len(vectors)} vectors reduced to {pca.n_components_} components")
+    logger.info(f"Total explained variance: {sum(pca.explained_variance_ratio_):.4f}")
+    
+    return pca_results
 
 # Function to check dash_player version and properties
 def check_dash_player():
@@ -1637,16 +2155,16 @@ dash_player_info = check_dash_player()
 logger.info(f"dash_player version: {dash_player_info['version']}")
 logger.info(f"dash_player props: {dash_player_info.get('props', [])}")
 
-# Function to cluster eventfulness vectors
-def cluster_eventfulness_vectors(peak_frames, algorithm='kmeans', n_clusters=3, eps=0.5):
+# Function to cluster eventfulness vectors using K-means with silhouette score analysis
+def cluster_eventfulness_vectors(peak_frames, max_clusters=6, vector_type='eventfulness'):
     """
-    Clusters eventfulness vectors from peak frames.
+    Clusters vectors from peak frames using K-means with silhouette score analysis
+    to determine the optimal number of clusters.
     
     Args:
-        peak_frames: Dictionary mapping peak indices to frame info (including eventfulness_vector)
-        algorithm: Clustering algorithm ('kmeans', 'dbscan', 'hierarchical')
-        n_clusters: Number of clusters for K-Means or Hierarchical clustering
-        eps: Epsilon parameter for DBSCAN
+        peak_frames: Dictionary mapping peak indices to frame info (including eventfulness_vector and pose_vector)
+        max_clusters: Maximum number of clusters to consider
+        vector_type: Type of vector to use ('eventfulness', 'pose', or 'combined')
         
     Returns:
         Dictionary mapping peak indices to cluster assignments, and cluster info
@@ -1659,71 +2177,114 @@ def cluster_eventfulness_vectors(peak_frames, algorithm='kmeans', n_clusters=3, 
     peak_indices = []
     
     for peak_idx, frame_info in peak_frames.items():
-        eventfulness_vector = frame_info.get('eventfulness_vector', None)
-        if eventfulness_vector is not None:
-            vectors.append(eventfulness_vector)
-            peak_indices.append(peak_idx)
+        if vector_type == 'eventfulness':
+            # Use eventfulness vector only
+            feature_vector = frame_info.get('eventfulness_vector', None)
+            if feature_vector is not None:
+                vectors.append(feature_vector)
+                peak_indices.append(peak_idx)
+        
+        elif vector_type == 'pose':
+            # Use pose vector only
+            feature_vector = frame_info.get('pose_vector', None)
+            pose_detected = frame_info.get('pose_detected', False)
+            if feature_vector is not None and pose_detected:
+                vectors.append(feature_vector)
+                peak_indices.append(peak_idx)
+        
+        elif vector_type == 'combined':
+            # Use both eventfulness and pose vectors
+            eventfulness_vector = frame_info.get('eventfulness_vector', None)
+            pose_vector = frame_info.get('pose_vector', None)
+            pose_detected = frame_info.get('pose_detected', False)
+            
+            if eventfulness_vector is not None and pose_vector is not None and pose_detected:
+                # Normalize each vector separately before combining
+                if len(eventfulness_vector) > 0:
+                    e_norm = np.linalg.norm(eventfulness_vector)
+                    if e_norm > 0:
+                        eventfulness_vector = [x / e_norm for x in eventfulness_vector]
+                
+                if len(pose_vector) > 0:
+                    p_norm = np.linalg.norm(pose_vector)
+                    if p_norm > 0:
+                        pose_vector = [x / p_norm for x in pose_vector]
+                
+                # Combine the vectors
+                combined_vector = eventfulness_vector + pose_vector
+                vectors.append(combined_vector)
+                peak_indices.append(peak_idx)
     
     if len(vectors) < 2:
-        logger.warning("Not enough vectors for clustering (need at least 2)")
+        logger.warning(f"Not enough {vector_type} vectors for clustering (need at least 2)")
         return None, None
     
     # Convert to numpy array
     X = np.array(vectors)
     
-    # Normalize vectors to unit vectors (L2 normalization)
-    # Calculate L2 norm for each vector
-    norms = np.linalg.norm(X, axis=1, keepdims=True)
-    # Avoid division by zero (if a vector is all zeros, keep it as is)
-    norms = np.where(norms == 0, 1, norms)
-    # Normalize to unit vectors
-    X_unit = X / norms
+    # Standardize the vectors (similar to PCA preprocessing)
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X)
     
-    logger.info(f"Normalized {len(vectors)} vectors to unit length before clustering")
+    logger.info(f"Standardized {len(vectors)} {vector_type} vectors before clustering")
     
-    # Perform clustering on unit vectors
+    # Try different k values and calculate silhouette scores
+    # Limit max_clusters to the number of vectors
+    max_k = min(max_clusters, len(vectors) - 1)
+    k_values = range(2, max_k + 1) if max_k >= 2 else [2]
+    silhouette_scores = []
+    
+    for k in k_values:
+        kmeans = KMeans(n_clusters=k, random_state=42, n_init=10)
+        labels = kmeans.fit_predict(X_scaled)
+        
+        # Calculate silhouette score if we have at least 2 clusters
+        if len(np.unique(labels)) > 1:
+            score = silhouette_score(X_scaled, labels)
+            silhouette_scores.append(score)
+            logger.info(f"K={k}, Silhouette Score: {score:.4f}")
+        else:
+            silhouette_scores.append(0)
+            logger.info(f"K={k}, Only one cluster found")
+    
+    # Apply a penalty to favor smaller k values
+    penalty_factor = 0.00  # Adjust this value to control how much to penalize larger cluster counts
+    penalized_scores = [score - (k * penalty_factor) for score, k in zip(silhouette_scores, k_values)]
+    
+    # Get best k from penalized scores
+    if not silhouette_scores:
+        best_k = 2  # Default if we couldn't calculate scores
+    else:
+        best_k = list(k_values)[np.argmax(penalized_scores)]
+    
+    logger.info(f"Selected optimal number of clusters: {best_k}")
+    
+    # Perform clustering with the optimal k
     cluster_assignments = {}
     cluster_info = {}
     
     try:
-        if algorithm == 'kmeans':
-            if n_clusters > len(vectors):
-                n_clusters = len(vectors)
-            kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
-            labels = kmeans.fit_predict(X_unit)
-            cluster_info = {
-                'algorithm': 'K-Means',
-                'n_clusters': n_clusters,
-                'n_samples': len(vectors),
-                'inertia': float(kmeans.inertia_)
-            }
-            
-        elif algorithm == 'dbscan':
-            dbscan = DBSCAN(eps=eps, min_samples=2)
-            labels = dbscan.fit_predict(X_unit)
-            n_clusters_found = len(set(labels)) - (1 if -1 in labels else 0)
-            n_noise = list(labels).count(-1)
-            cluster_info = {
-                'algorithm': 'DBSCAN',
-                'n_clusters': n_clusters_found,
-                'n_samples': len(vectors),
-                'n_noise': n_noise,
-                'eps': eps
-            }
-            
-        elif algorithm == 'hierarchical':
-            if n_clusters > len(vectors):
-                n_clusters = len(vectors)
-            hierarchical = AgglomerativeClustering(n_clusters=n_clusters)
-            labels = hierarchical.fit_predict(X_unit)
-            cluster_info = {
-                'algorithm': 'Hierarchical',
-                'n_clusters': n_clusters,
-                'n_samples': len(vectors)
-            }
+        # Apply K-means with best k
+        kmeans = KMeans(n_clusters=best_k, random_state=42, n_init=10)
+        labels = kmeans.fit_predict(X_scaled)
+        
+        # Calculate silhouette score for the final clustering
+        if len(np.unique(labels)) > 1:
+            sil_score = silhouette_score(X_scaled, labels)
         else:
-            logger.error(f"Unknown clustering algorithm: {algorithm}")
-            return None, None
+            sil_score = 0
+        
+        cluster_info = {
+            'algorithm': 'K-Means',
+            'vector_type': vector_type,
+            'n_clusters': best_k,
+            'n_samples': len(vectors),
+            'silhouette_score': float(sil_score),
+            'inertia': float(kmeans.inertia_),
+            'k_values': list(k_values),
+            'silhouette_scores': silhouette_scores,
+            'penalized_scores': penalized_scores
+        }
         
         # Map peak indices to cluster assignments
         for i, peak_idx in enumerate(peak_indices):
@@ -1756,7 +2317,8 @@ def detect_local_maxima(data):
 
 def extract_frames_at_peaks(video_path, peaks, video_info, eventfulness_data):
     """
-    Extracts frames from the video at peak locations and extracts full eventfulness vectors.
+    Extracts frames from the video at peak locations, extracts full eventfulness vectors,
+    and performs pose estimation on each frame.
     
     Args:
         video_path: Path to the video file
@@ -1765,7 +2327,7 @@ def extract_frames_at_peaks(video_path, peaks, video_info, eventfulness_data):
         eventfulness_data: Dictionary containing eventfulness data
         
     Returns:
-        Dictionary mapping peak indices to extracted frame paths and eventfulness vectors
+        Dictionary mapping peak indices to extracted frame paths, eventfulness vectors, and pose vectors
     """
     import cv2
     import os
@@ -1808,9 +2370,16 @@ def extract_frames_at_peaks(video_path, peaks, video_info, eventfulness_data):
         # Read the frame
         ret, frame = cap.read()
         if ret:
-            # Save the frame
+            # Perform pose estimation on the frame
+            annotated_frame, pose_vector, pose_success = perform_pose_estimation(frame)
+            
+            # Save the original frame
             frame_path = os.path.join(frames_dir, f"peak_{i}_idx_{peak_idx}_frame_{frame_number}.jpg")
             cv2.imwrite(frame_path, frame)
+            
+            # Save the annotated frame with pose landmarks
+            annotated_frame_path = os.path.join(frames_dir, f"pose_annotated_peak_{i}_idx_{peak_idx}_frame_{frame_number}.jpg")
+            cv2.imwrite(annotated_frame_path, annotated_frame)
             
             # Extract full eventfulness vector for this peak
             eventfulness_vector = None
@@ -1821,23 +2390,26 @@ def extract_frames_at_peaks(video_path, peaks, video_info, eventfulness_data):
             else:
                 logger.warning(f"Full eventfulness vectors not available for peak {i}: index={peak_idx}")
             
-            # Store the mapping
+            # Store the mapping with pose vector
             peak_frames[peak_idx] = {
                 'path': frame_path,
+                'annotated_path': annotated_frame_path,
                 'frame_number': frame_number,
                 'peak_value': eventfulness_data['data'][peak_idx],
                 'eventfulness_vector': eventfulness_vector,  # Full vector
+                'pose_vector': pose_vector,  # Pose landmarks vector
+                'pose_detected': pose_success,  # Whether pose detection was successful
                 'time': frame_number / fps
             }
             
-            logger.info(f"Extracted frame at peak {i}: index={peak_idx}, frame={frame_number}, time={frame_number/fps:.2f}s")
+            logger.info(f"Extracted frame at peak {i}: index={peak_idx}, frame={frame_number}, time={frame_number/fps:.2f}s, pose_detected={pose_success}")
         else:
             logger.error(f"Failed to extract frame at peak {i}: index={peak_idx}, frame={frame_number}")
     
     # Release the video
     cap.release()
     
-    # Save peak frames data with eventfulness vectors to config.json if config_path is available
+    # Save peak frames data with eventfulness vectors and pose vectors to config.json if config_path is available
     if config_path and peak_frames:
         try:
             # Load existing config
@@ -1852,7 +2424,10 @@ def extract_frames_at_peaks(video_path, peaks, video_info, eventfulness_data):
                     'time': frame_info['time'],
                     'peak_value': frame_info['peak_value'],
                     'eventfulness_vector': frame_info['eventfulness_vector'],
-                    'frame_path': frame_info['path']
+                    'pose_vector': frame_info['pose_vector'],
+                    'pose_detected': frame_info['pose_detected'],
+                    'frame_path': frame_info['path'],
+                    'annotated_path': frame_info['annotated_path']
                 }
             
             # Add peak_frames_data to config
@@ -1862,7 +2437,7 @@ def extract_frames_at_peaks(video_path, peaks, video_info, eventfulness_data):
             with open(config_path, 'w') as f:
                 json.dump(config, f, indent=2)
             
-            logger.info(f"Saved peak frames data with eventfulness vectors to {config_path}")
+            logger.info(f"Saved peak frames data with eventfulness and pose vectors to {config_path}")
         except Exception as e:
             logger.error(f"Failed to save peak frames data to config.json: {str(e)}")
     
@@ -1984,6 +2559,61 @@ def find_next_maximum(data, current_index, peaks):
     return next_peak, distance, peak_value
 
 # Note: Simplified implementation to focus only on local maxima
+
+# Function to perform pose estimation on an image
+def perform_pose_estimation(image):
+    """
+    Performs pose estimation on an image using MediaPipe.
+    
+    Args:
+        image: OpenCV image (BGR format)
+        
+    Returns:
+        Tuple containing:
+        - annotated_image: Image with pose landmarks drawn
+        - pose_vector: Flattened vector of pose landmarks (x, y, z, visibility for each landmark)
+        - success: Boolean indicating if pose estimation was successful
+    """
+    # Initialize MediaPipe Pose
+    mp_pose = mp.solutions.pose
+    mp_drawing = mp.solutions.drawing_utils
+    mp_drawing_styles = mp.solutions.drawing_styles
+    
+    # Convert to RGB for MediaPipe
+    image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    
+    # Process the image
+    with mp_pose.Pose(
+        static_image_mode=True,
+        model_complexity=0,
+        enable_segmentation=True,
+        min_detection_confidence=0.5) as pose:
+        
+        results = pose.process(image_rgb)
+        
+        # Create pose vector
+        pose_vector = []
+        success = False
+        
+        if results.pose_landmarks:
+            success = True
+            # Extract landmarks into a flat vector
+            for landmark in results.pose_landmarks.landmark:
+                pose_vector.extend([landmark.x, landmark.y, landmark.z, landmark.visibility])
+            
+            # Create annotated image
+            annotated_image = image.copy()
+            mp_drawing.draw_landmarks(
+                annotated_image,
+                results.pose_landmarks,
+                mp_pose.POSE_CONNECTIONS,
+                landmark_drawing_spec=mp_drawing_styles.get_default_pose_landmarks_style())
+        else:
+            # If no landmarks detected, return the original image and an empty vector
+            annotated_image = image
+            pose_vector = [0] * (33 * 4)  # 33 landmarks with x, y, z, visibility
+        
+        return annotated_image, pose_vector, success
 
 # Function to verify marker updates
 def verify_marker_position(figure, expected_position, expected_value):
