@@ -49,6 +49,7 @@ if config.num_labels > 0:
     num_labels = config.num_labels
 
 print(num_labels)
+# This is the ResNet R(2+1)D model for video analysis and temporal convolution. 
 visbeat = VisBeatDetectionModel(config.model_config, config.model_type, config.ngpu, 
                                 config.layer_num, config.feature_extract, use_pretrained=config.use_pretrained,
                                 inplanes = config.inplanes,

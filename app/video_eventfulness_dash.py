@@ -11,6 +11,9 @@ import base64
 import logging
 import datetime
 from scipy.signal import find_peaks
+from sklearn.cluster import KMeans, DBSCAN, AgglomerativeClustering
+from sklearn.preprocessing import StandardScaler
+from sklearn.manifold import TSNE
 
 # Set up logging
 log_file = "/home/is1893/Mirror2/dataSets/test_data/results/sync_debug.log"
@@ -251,8 +254,10 @@ if os.path.exists(default_video_path):
         # Get default eventfulness data
         if default_config and "eventfulness" in default_config and len(default_config["eventfulness"]) > 0:
             default_eventfulness_data = {
-                "data": default_config["eventfulness"][0],
-                "fps": default_config.get("fps", fps)
+                "data": default_config["eventfulness"][0],  # First dimension for visualization
+                "full_vectors": default_config["eventfulness"],  # Full eventfulness vectors (all dimensions)
+                "fps": default_config.get("fps", fps),
+                "config_path": default_config_path
             }
 
 # Define the app layout
@@ -267,6 +272,7 @@ app.layout = html.Div([
     dcc.Store(id='peak-data', data=None),  # Store for detected peaks and dance steps
     dcc.Store(id='peak-frames', data=None),  # Store for extracted frames at peaks
     dcc.Store(id='sliding-window-frames', data=None),  # Store for sliding window frames
+    dcc.Store(id='cluster-assignments', data=None),  # Store for cluster assignments
     
     # Main layout with file browser and content area
     html.Div([
@@ -344,7 +350,59 @@ app.layout = html.Div([
                 html.Div([
                     html.H3("Extracted Peak Frames"),
                     html.Div([
-                        html.Div("Frames extracted at detected peaks:", style={'marginBottom': '10px'}),
+                        html.Div([
+                            html.Div("Frames extracted at detected peaks:", style={'marginBottom': '10px', 'display': 'inline-block', 'marginRight': '20px'}),
+                            html.Button("Cluster Vectors", id='cluster-button', n_clicks=0, style={
+                                'marginBottom': '10px',
+                                'padding': '8px 16px',
+                                'backgroundColor': '#2196F3',
+                                'color': 'white',
+                                'border': 'none',
+                                'borderRadius': '4px',
+                                'cursor': 'pointer'
+                            }),
+                        ], style={'marginBottom': '10px'}),
+                        html.Div([
+                            html.Label("Clustering Algorithm:", style={'marginRight': '10px'}),
+                            dcc.Dropdown(
+                                id='cluster-algorithm',
+                                options=[
+                                    {'label': 'K-Means', 'value': 'kmeans'},
+                                    {'label': 'DBSCAN', 'value': 'dbscan'},
+                                    {'label': 'Hierarchical', 'value': 'hierarchical'}
+                                ],
+                                value='kmeans',
+                                style={'width': '200px', 'display': 'inline-block', 'marginRight': '20px'}
+                            ),
+                            html.Label("Number of Clusters (K-Means/Hierarchical):", style={'marginRight': '10px'}),
+                            dcc.Input(
+                                id='n-clusters',
+                                type='number',
+                                value=3,
+                                min=2,
+                                max=10,
+                                style={'width': '80px', 'display': 'inline-block', 'marginRight': '20px'}
+                            ),
+                            html.Label("Epsilon (DBSCAN):", style={'marginRight': '10px'}),
+                            dcc.Input(
+                                id='dbscan-eps',
+                                type='number',
+                                value=0.5,
+                                min=0.1,
+                                max=2.0,
+                                step=0.1,
+                                style={'width': '80px', 'display': 'inline-block'}
+                            ),
+                        ], id='cluster-controls', style={'marginBottom': '10px', 'display': 'block'}),
+                        html.Div(id='cluster-info', style={'marginBottom': '10px', 'fontSize': '0.9em', 'color': '#666'}),
+                        html.Div([
+                            html.H4("Cluster Visualization"),
+                            dcc.Graph(
+                                id='cluster-visualization',
+                                style={'height': '400px'},
+                                config={'displayModeBar': True}
+                            ),
+                        ], id='cluster-viz-section', style={'display': 'none', 'marginBottom': '20px'}),
                         html.Div(id='peak-frames-gallery', style={'display': 'flex', 'flexWrap': 'wrap', 'gap': '10px'}),
                     ], style={'border': '1px solid #ddd', 'borderRadius': '5px', 'padding': '15px', 'backgroundColor': '#f9f9f9'})
                 ], id='peak-frames-section', style={'display': 'none', 'marginTop': '20px'}),
@@ -449,8 +507,10 @@ def select_video(n_clicks, ids):
     
     if config and "eventfulness" in config and len(config["eventfulness"]) > 0:
         eventfulness_data = {
-            "data": config["eventfulness"][0],
-            "fps": config.get("fps", fps)
+            "data": config["eventfulness"][0],  # First dimension for visualization
+            "full_vectors": config["eventfulness"],  # Full eventfulness vectors (all dimensions)
+            "fps": config.get("fps", fps),
+            "config_path": config_path
         }
     
     return video_path, video_info, eventfulness_data
@@ -1183,43 +1243,349 @@ def update_sliding_window(n_intervals, current_time, video_info, peak_frames):
     logger.info(f"[{timestamp}] Updated sliding window with {len(frame_elements)} peak frames")
     return frame_elements
 
-# Callback to update peak frames gallery
+# Callback to handle clustering button and show controls
+@callback(
+    [Output('cluster-controls', 'style'),
+     Output('cluster-assignments', 'data'),
+     Output('cluster-info', 'children'),
+     Output('cluster-viz-section', 'style')],
+    [Input('cluster-button', 'n_clicks'),
+     Input('cluster-algorithm', 'value')],
+    [State('peak-frames', 'data'),
+     State('n-clusters', 'value'),
+     State('dbscan-eps', 'value'),
+     State('cluster-assignments', 'data')],
+    prevent_initial_call=True
+)
+def handle_clustering(n_clicks, algorithm, peak_frames, n_clusters, dbscan_eps, existing_assignments):
+    ctx = dash.callback_context
+    if not ctx.triggered:
+        return {'display': 'none'}, existing_assignments, "", {'display': 'none'}
+    
+    trigger_id = ctx.triggered[0]['prop_id'].split('.')[0]
+    
+    # Show controls when button is clicked
+    if trigger_id == 'cluster-button' and n_clicks > 0:
+        if not peak_frames:
+            return {'display': 'block'}, existing_assignments, html.Div("No peak frames available for clustering.", style={'color': 'red'}), {'display': 'none'}
+        
+        # Perform clustering
+        eps = dbscan_eps if dbscan_eps else 0.5
+        n_clust = n_clusters if n_clusters else 3
+        
+        cluster_assignments, cluster_info = cluster_eventfulness_vectors(
+            peak_frames, 
+            algorithm=algorithm, 
+            n_clusters=n_clust, 
+            eps=eps
+        )
+        
+        if cluster_assignments is None:
+            return {'display': 'block'}, existing_assignments, html.Div("Clustering failed. Check logs for details.", style={'color': 'red'}), {'display': 'none'}
+        
+        # Create info display
+        info_text = f"Algorithm: {cluster_info['algorithm']}, Clusters: {cluster_info['n_clusters']}, Samples: {cluster_info['n_samples']}"
+        if 'n_noise' in cluster_info:
+            info_text += f", Noise points: {cluster_info['n_noise']}"
+        
+        return {'display': 'block'}, cluster_assignments, html.Div(info_text, style={'color': '#2196F3', 'fontWeight': 'bold'}), {'display': 'block'}
+    
+    # Show controls when algorithm changes (but don't re-cluster)
+    if trigger_id == 'cluster-algorithm':
+        viz_style = {'display': 'block'} if existing_assignments else {'display': 'none'}
+        return {'display': 'block'}, existing_assignments, "", viz_style
+    
+    return {'display': 'none'}, existing_assignments, "", {'display': 'none'}
+
+# Callback to update peak frames gallery with cluster colors
 @callback(
     Output('peak-frames-gallery', 'children'),
-    Input('peak-frames', 'data')
+    [Input('peak-frames', 'data'),
+     Input('cluster-assignments', 'data')]
 )
-def update_peak_frames_gallery(peak_frames):
+def update_peak_frames_gallery(peak_frames, cluster_assignments):
     if not peak_frames:
         return html.Div("No peak frames extracted yet.")
+    
+    # Define color palette for clusters
+    cluster_colors = [
+        '#FF6B6B', '#4ECDC4', '#45B7D1', '#FFA07A', '#98D8C8',
+        '#F7DC6F', '#BB8FCE', '#85C1E2', '#F8B739', '#E74C3C'
+    ]
     
     # Create a gallery of frame thumbnails
     frame_elements = []
     
-    # Sort peaks by their index
-    sorted_peaks = sorted(peak_frames.keys(), key=lambda x: int(x))
+    # Sort peaks by cluster first, then by time within each cluster
+    # If no clusters, sort by peak index
+    if cluster_assignments:
+        # Group by cluster
+        cluster_groups = {}
+        for peak_idx in peak_frames.keys():
+            cluster_id = cluster_assignments.get(str(peak_idx), -999)  # -999 for unclustered
+            if cluster_id not in cluster_groups:
+                cluster_groups[cluster_id] = []
+            cluster_groups[cluster_id].append(peak_idx)
+        
+        # Sort clusters (noise points last)
+        sorted_cluster_ids = sorted([c for c in cluster_groups.keys() if c != -999])
+        if -999 in cluster_groups:
+            sorted_cluster_ids.append(-999)
+        if -1 in cluster_groups:  # DBSCAN noise
+            sorted_cluster_ids.remove(-1)
+            sorted_cluster_ids.append(-1)
+        
+        # Sort peaks: by cluster, then by time within cluster
+        sorted_peaks = []
+        for cluster_id in sorted_cluster_ids:
+            cluster_peaks = cluster_groups[cluster_id]
+            # Sort by time within cluster
+            cluster_peaks_sorted = sorted(cluster_peaks, key=lambda x: peak_frames[x]['time'])
+            sorted_peaks.extend(cluster_peaks_sorted)
+    else:
+        # No clustering, sort by peak index
+        sorted_peaks = sorted(peak_frames.keys(), key=lambda x: int(x))
     
     for peak_idx in sorted_peaks:
         frame_info = peak_frames[peak_idx]
         frame_path = frame_info['path']
         peak_value = frame_info['peak_value']
         time = frame_info['time']
+        eventfulness_vector = frame_info.get('eventfulness_vector', None)
+        
+        # Get cluster assignment if available
+        cluster_id = None
+        if cluster_assignments and str(peak_idx) in cluster_assignments:
+            cluster_id = cluster_assignments[str(peak_idx)]
+        
+        # Calculate magnitude of eventfulness vector if available
+        vector_magnitude = None
+        if eventfulness_vector:
+            # Magnitude = ||v|| = sqrt(sum(v[i]^2))
+            vector_magnitude = np.linalg.norm(eventfulness_vector)
         
         # Get relative path for URL
         rel_path = os.path.relpath(frame_path, RESULTS_DIR)
         frame_url = f"/frame/{rel_path}"
         
+        # Determine border color based on cluster
+        border_color = '#ddd'
+        border_width = '1px'
+        if cluster_id is not None:
+            if cluster_id == -1:  # Noise point (DBSCAN)
+                border_color = '#999'
+                border_width = '2px'
+            else:
+                border_color = cluster_colors[cluster_id % len(cluster_colors)]
+                border_width = '3px'
+        
+        # Create info div with peak value, time, magnitude, and cluster
+        info_divs = [
+            html.Div(f"Peak: {peak_value:.3f}", style={'fontSize': '0.8em'}),
+            html.Div(f"Time: {time:.2f}s", style={'fontSize': '0.8em'}),
+        ]
+        
+        # Add magnitude if available
+        if vector_magnitude is not None:
+            info_divs.append(
+                html.Div(f"Magnitude: {vector_magnitude:.3f}", style={'fontSize': '0.8em', 'fontWeight': 'bold', 'color': '#2196F3'})
+            )
+        
+        # Add cluster assignment if available
+        if cluster_id is not None:
+            if cluster_id == -1:
+                cluster_text = "Noise"
+                cluster_color = '#999'
+            else:
+                cluster_text = f"Cluster {cluster_id}"
+                cluster_color = border_color
+            info_divs.append(
+                html.Div(cluster_text, style={
+                    'fontSize': '0.9em', 
+                    'fontWeight': 'bold', 
+                    'color': cluster_color,
+                    'marginTop': '3px',
+                    'padding': '2px 5px',
+                    'backgroundColor': 'rgba(255,255,255,0.8)',
+                    'borderRadius': '3px'
+                })
+            )
+        
         # Create a thumbnail with info
         thumbnail = html.Div([
             html.Img(src=frame_url, style={'width': '150px', 'height': 'auto', 'objectFit': 'cover'}),
-            html.Div([
-                html.Div(f"Peak: {peak_value:.3f}", style={'fontSize': '0.8em'}),
-                html.Div(f"Time: {time:.2f}s", style={'fontSize': '0.8em'}),
-            ], style={'textAlign': 'center', 'marginTop': '5px'})
-        ], style={'border': '1px solid #ddd', 'padding': '5px', 'borderRadius': '5px'})
+            html.Div(info_divs, style={'textAlign': 'center', 'marginTop': '5px'})
+        ], style={
+            'border': f'{border_width} solid {border_color}', 
+            'padding': '5px', 
+            'borderRadius': '5px',
+            'backgroundColor': 'white' if cluster_id is None else 'rgba(255,255,255,0.95)'
+        })
         
         frame_elements.append(thumbnail)
     
     return frame_elements
+
+# Callback to create cluster visualization
+@callback(
+    Output('cluster-visualization', 'figure'),
+    [Input('peak-frames', 'data'),
+     Input('cluster-assignments', 'data')]
+)
+def update_cluster_visualization(peak_frames, cluster_assignments):
+    if not peak_frames or not cluster_assignments:
+        # Return empty figure
+        fig = go.Figure()
+        fig.add_annotation(
+            text="No clustering data available. Click 'Cluster Vectors' to perform clustering.",
+            xref="paper", yref="paper",
+            x=0.5, y=0.5, showarrow=False,
+            font=dict(size=14, color="gray")
+        )
+        fig.update_layout(
+            title="Cluster Visualization",
+            xaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
+            yaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
+            plot_bgcolor='white'
+        )
+        return fig
+    
+    # Extract vectors and cluster assignments
+    vectors = []
+    peak_indices = []
+    cluster_labels = []
+    
+    for peak_idx, frame_info in peak_frames.items():
+        eventfulness_vector = frame_info.get('eventfulness_vector', None)
+        if eventfulness_vector is not None:
+            cluster_id = cluster_assignments.get(str(peak_idx), None)
+            if cluster_id is not None:
+                vectors.append(eventfulness_vector)
+                peak_indices.append(peak_idx)
+                cluster_labels.append(cluster_id)
+    
+    if len(vectors) < 2:
+        fig = go.Figure()
+        fig.add_annotation(
+            text="Not enough vectors for visualization (need at least 2).",
+            xref="paper", yref="paper",
+            x=0.5, y=0.5, showarrow=False,
+            font=dict(size=14, color="gray")
+        )
+        fig.update_layout(
+            title="Cluster Visualization",
+            xaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
+            yaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
+            plot_bgcolor='white'
+        )
+        return fig
+    
+    # Convert to numpy array
+    X = np.array(vectors)
+    
+    # Standardize the features
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X)
+    
+    # Use t-SNE for dimensionality reduction (2D visualization)
+    try:
+        # Use PCA first if we have too many dimensions (t-SNE can be slow)
+        if X_scaled.shape[1] > 50:
+            from sklearn.decomposition import PCA
+            pca = PCA(n_components=50)
+            X_reduced = pca.fit_transform(X_scaled)
+        else:
+            X_reduced = X_scaled
+        
+        # Apply t-SNE
+        tsne = TSNE(n_components=2, random_state=42, perplexity=min(30, len(vectors)-1))
+        X_2d = tsne.fit_transform(X_reduced)
+    except Exception as e:
+        logger.error(f"Error in t-SNE: {str(e)}")
+        # Fallback to PCA
+        from sklearn.decomposition import PCA
+        pca = PCA(n_components=2)
+        X_2d = pca.fit_transform(X_scaled)
+    
+    # Define color palette for clusters
+    cluster_colors = [
+        '#FF6B6B', '#4ECDC4', '#45B7D1', '#FFA07A', '#98D8C8',
+        '#F7DC6F', '#BB8FCE', '#85C1E2', '#F8B739', '#E74C3C'
+    ]
+    
+    # Create figure
+    fig = go.Figure()
+    
+    # Group points by cluster
+    unique_clusters = sorted(set(cluster_labels))
+    
+    for cluster_id in unique_clusters:
+        # Get indices for this cluster
+        cluster_mask = [i for i, c in enumerate(cluster_labels) if c == cluster_id]
+        
+        if cluster_id == -1:
+            # Noise points
+            cluster_name = "Noise"
+            color = '#999999'
+            symbol = 'x'
+            size = 8
+        else:
+            cluster_name = f"Cluster {cluster_id}"
+            color = cluster_colors[cluster_id % len(cluster_colors)]
+            symbol = 'circle'
+            size = 10
+        
+        # Extract coordinates for this cluster
+        x_coords = [X_2d[i, 0] for i in cluster_mask]
+        y_coords = [X_2d[i, 1] for i in cluster_mask]
+        
+        # Create hover text with peak info
+        hover_texts = []
+        for i in cluster_mask:
+            peak_idx = peak_indices[i]
+            frame_info = peak_frames[peak_idx]
+            hover_texts.append(
+                f"Peak Index: {peak_idx}<br>" +
+                f"Time: {frame_info['time']:.2f}s<br>" +
+                f"Peak Value: {frame_info['peak_value']:.3f}<br>" +
+                f"Cluster: {cluster_name}"
+            )
+        
+        fig.add_trace(go.Scatter(
+            x=x_coords,
+            y=y_coords,
+            mode='markers',
+            name=cluster_name,
+            marker=dict(
+                color=color,
+                size=size,
+                symbol=symbol,
+                line=dict(width=1, color='white') if cluster_id != -1 else dict(width=0)
+            ),
+            text=hover_texts,
+            hoverinfo='text',
+            showlegend=True
+        ))
+    
+    # Update layout
+    fig.update_layout(
+        title="Cluster Visualization (t-SNE)",
+        xaxis=dict(title="t-SNE Dimension 1", showgrid=True),
+        yaxis=dict(title="t-SNE Dimension 2", showgrid=True),
+        hovermode='closest',
+        plot_bgcolor='white',
+        width=800,
+        height=400,
+        legend=dict(
+            orientation="h",
+            yanchor="bottom",
+            y=1.02,
+            xanchor="right",
+            x=1
+        )
+    )
+    
+    return fig
 
 # Callback to clear the log file
 @callback(
@@ -1271,6 +1637,105 @@ dash_player_info = check_dash_player()
 logger.info(f"dash_player version: {dash_player_info['version']}")
 logger.info(f"dash_player props: {dash_player_info.get('props', [])}")
 
+# Function to cluster eventfulness vectors
+def cluster_eventfulness_vectors(peak_frames, algorithm='kmeans', n_clusters=3, eps=0.5):
+    """
+    Clusters eventfulness vectors from peak frames.
+    
+    Args:
+        peak_frames: Dictionary mapping peak indices to frame info (including eventfulness_vector)
+        algorithm: Clustering algorithm ('kmeans', 'dbscan', 'hierarchical')
+        n_clusters: Number of clusters for K-Means or Hierarchical clustering
+        eps: Epsilon parameter for DBSCAN
+        
+    Returns:
+        Dictionary mapping peak indices to cluster assignments, and cluster info
+    """
+    if not peak_frames:
+        return None, None
+    
+    # Extract vectors and corresponding peak indices
+    vectors = []
+    peak_indices = []
+    
+    for peak_idx, frame_info in peak_frames.items():
+        eventfulness_vector = frame_info.get('eventfulness_vector', None)
+        if eventfulness_vector is not None:
+            vectors.append(eventfulness_vector)
+            peak_indices.append(peak_idx)
+    
+    if len(vectors) < 2:
+        logger.warning("Not enough vectors for clustering (need at least 2)")
+        return None, None
+    
+    # Convert to numpy array
+    X = np.array(vectors)
+    
+    # Normalize vectors to unit vectors (L2 normalization)
+    # Calculate L2 norm for each vector
+    norms = np.linalg.norm(X, axis=1, keepdims=True)
+    # Avoid division by zero (if a vector is all zeros, keep it as is)
+    norms = np.where(norms == 0, 1, norms)
+    # Normalize to unit vectors
+    X_unit = X / norms
+    
+    logger.info(f"Normalized {len(vectors)} vectors to unit length before clustering")
+    
+    # Perform clustering on unit vectors
+    cluster_assignments = {}
+    cluster_info = {}
+    
+    try:
+        if algorithm == 'kmeans':
+            if n_clusters > len(vectors):
+                n_clusters = len(vectors)
+            kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
+            labels = kmeans.fit_predict(X_unit)
+            cluster_info = {
+                'algorithm': 'K-Means',
+                'n_clusters': n_clusters,
+                'n_samples': len(vectors),
+                'inertia': float(kmeans.inertia_)
+            }
+            
+        elif algorithm == 'dbscan':
+            dbscan = DBSCAN(eps=eps, min_samples=2)
+            labels = dbscan.fit_predict(X_unit)
+            n_clusters_found = len(set(labels)) - (1 if -1 in labels else 0)
+            n_noise = list(labels).count(-1)
+            cluster_info = {
+                'algorithm': 'DBSCAN',
+                'n_clusters': n_clusters_found,
+                'n_samples': len(vectors),
+                'n_noise': n_noise,
+                'eps': eps
+            }
+            
+        elif algorithm == 'hierarchical':
+            if n_clusters > len(vectors):
+                n_clusters = len(vectors)
+            hierarchical = AgglomerativeClustering(n_clusters=n_clusters)
+            labels = hierarchical.fit_predict(X_unit)
+            cluster_info = {
+                'algorithm': 'Hierarchical',
+                'n_clusters': n_clusters,
+                'n_samples': len(vectors)
+            }
+        else:
+            logger.error(f"Unknown clustering algorithm: {algorithm}")
+            return None, None
+        
+        # Map peak indices to cluster assignments
+        for i, peak_idx in enumerate(peak_indices):
+            cluster_assignments[str(peak_idx)] = int(labels[i])
+        
+        logger.info(f"Clustering completed: {cluster_info}")
+        return cluster_assignments, cluster_info
+        
+    except Exception as e:
+        logger.error(f"Error during clustering: {str(e)}")
+        return None, None
+
 # Function to detect local maxima in eventfulness data
 def detect_local_maxima(data):
     """
@@ -1291,7 +1756,7 @@ def detect_local_maxima(data):
 
 def extract_frames_at_peaks(video_path, peaks, video_info, eventfulness_data):
     """
-    Extracts frames from the video at peak locations.
+    Extracts frames from the video at peak locations and extracts full eventfulness vectors.
     
     Args:
         video_path: Path to the video file
@@ -1300,7 +1765,7 @@ def extract_frames_at_peaks(video_path, peaks, video_info, eventfulness_data):
         eventfulness_data: Dictionary containing eventfulness data
         
     Returns:
-        Dictionary mapping peak indices to extracted frame paths
+        Dictionary mapping peak indices to extracted frame paths and eventfulness vectors
     """
     import cv2
     import os
@@ -1321,6 +1786,10 @@ def extract_frames_at_peaks(video_path, peaks, video_info, eventfulness_data):
     # Get video properties
     fps = video_info['fps']
     frame_count = video_info['frame_count']
+    
+    # Get full eventfulness vectors if available
+    full_vectors = eventfulness_data.get('full_vectors', None)
+    config_path = eventfulness_data.get('config_path', None)
     
     # Dictionary to store peak index to frame path mapping
     peak_frames = {}
@@ -1343,11 +1812,21 @@ def extract_frames_at_peaks(video_path, peaks, video_info, eventfulness_data):
             frame_path = os.path.join(frames_dir, f"peak_{i}_idx_{peak_idx}_frame_{frame_number}.jpg")
             cv2.imwrite(frame_path, frame)
             
+            # Extract full eventfulness vector for this peak
+            eventfulness_vector = None
+            if full_vectors and peak_idx < len(full_vectors[0]):
+                # Extract the full vector: [full_vectors[dim][peak_idx] for dim in range(len(full_vectors))]
+                eventfulness_vector = [full_vectors[dim][peak_idx] for dim in range(len(full_vectors))]
+                logger.info(f"Extracted full eventfulness vector for peak {i}: index={peak_idx}, vector_length={len(eventfulness_vector)}")
+            else:
+                logger.warning(f"Full eventfulness vectors not available for peak {i}: index={peak_idx}")
+            
             # Store the mapping
             peak_frames[peak_idx] = {
                 'path': frame_path,
                 'frame_number': frame_number,
                 'peak_value': eventfulness_data['data'][peak_idx],
+                'eventfulness_vector': eventfulness_vector,  # Full vector
                 'time': frame_number / fps
             }
             
@@ -1357,6 +1836,35 @@ def extract_frames_at_peaks(video_path, peaks, video_info, eventfulness_data):
     
     # Release the video
     cap.release()
+    
+    # Save peak frames data with eventfulness vectors to config.json if config_path is available
+    if config_path and peak_frames:
+        try:
+            # Load existing config
+            with open(config_path, 'r') as f:
+                config = json.load(f)
+            
+            # Create peak_frames_data structure
+            peak_frames_data = {}
+            for peak_idx, frame_info in peak_frames.items():
+                peak_frames_data[str(peak_idx)] = {
+                    'frame_number': frame_info['frame_number'],
+                    'time': frame_info['time'],
+                    'peak_value': frame_info['peak_value'],
+                    'eventfulness_vector': frame_info['eventfulness_vector'],
+                    'frame_path': frame_info['path']
+                }
+            
+            # Add peak_frames_data to config
+            config['peak_frames'] = peak_frames_data
+            
+            # Save updated config
+            with open(config_path, 'w') as f:
+                json.dump(config, f, indent=2)
+            
+            logger.info(f"Saved peak frames data with eventfulness vectors to {config_path}")
+        except Exception as e:
+            logger.error(f"Failed to save peak frames data to config.json: {str(e)}")
     
     logger.info(f"Extracted {len(peak_frames)} frames to {frames_dir}")
     return peak_frames
