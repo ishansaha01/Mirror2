@@ -10,6 +10,7 @@ from pathlib import Path
 import base64
 import logging
 import datetime
+import copy
 from scipy.signal import find_peaks
 from sklearn.cluster import KMeans, DBSCAN, AgglomerativeClustering
 from sklearn.preprocessing import StandardScaler
@@ -276,6 +277,7 @@ app.layout = html.Div([
     dcc.Store(id='peak-frames', data=None),  # Store for extracted frames at peaks
     dcc.Store(id='sliding-window-frames', data=None),  # Store for sliding window frames
     dcc.Store(id='cluster-assignments', data=None),  # Store for cluster assignments
+    dcc.Store(id='sequence-description', data=None),  # Store for sequence description
     dcc.Store(id='pca-results', data=None),  # Store for PCA analysis results
     
     # Main layout with file browser and content area
@@ -415,6 +417,15 @@ app.layout = html.Div([
                                 config={'displayModeBar': True}
                             ),
                         ], id='cluster-viz-section', style={'display': 'none', 'marginBottom': '20px'}),
+                        
+                        # Sequence Description Section
+                        html.Div([
+                            html.H4("Video Sequence Description", className="section-header"),
+                            html.Button("Generate Sequence Description", id='generate-sequence-btn', n_clicks=0,
+                                       style={'marginBottom': '10px'}),
+                            html.Div(id='sequence-description-display', style={'whiteSpace': 'pre-wrap'}),
+                            dcc.Graph(id='sequence-timeline', style={'marginTop': '15px', 'height': '250px'})
+                        ], id='sequence-description-section', style={'display': 'none', 'marginBottom': '20px'}),
                         
                         # PCA Analysis Section
                         html.Div([
@@ -1299,7 +1310,8 @@ def update_sliding_window(n_intervals, current_time, video_info, peak_frames):
     [Output('cluster-controls', 'style'),
      Output('cluster-assignments', 'data'),
      Output('cluster-info', 'children'),
-     Output('cluster-viz-section', 'style')],
+     Output('cluster-viz-section', 'style'),
+     Output('sequence-description-section', 'style')],
     [Input('cluster-button', 'n_clicks'),
      Input('vector-type', 'value')],
     [State('peak-frames', 'data'),
@@ -1310,14 +1322,14 @@ def update_sliding_window(n_intervals, current_time, video_info, peak_frames):
 def handle_clustering(n_clicks, vector_type, peak_frames, max_clusters, existing_assignments):
     ctx = dash.callback_context
     if not ctx.triggered:
-        return {'display': 'none'}, existing_assignments, "", {'display': 'none'}
+        return {'display': 'none'}, existing_assignments, "", {'display': 'none'}, {'display': 'none'}
     
     trigger_id = ctx.triggered[0]['prop_id'].split('.')[0]
     
     # Show controls when button is clicked
     if trigger_id == 'cluster-button' and n_clicks > 0:
         if not peak_frames:
-            return {'display': 'block'}, existing_assignments, html.Div("No peak frames available for clustering.", style={'color': 'red'}), {'display': 'none'}
+            return {'display': 'block'}, existing_assignments, html.Div("No peak frames available for clustering.", style={'color': 'red'}), {'display': 'none'}, {'display': 'none'}
         
         # Perform clustering with K-means and silhouette score analysis
         max_k = max_clusters if max_clusters else 40
@@ -1362,14 +1374,98 @@ def handle_clustering(n_clicks, vector_type, peak_frames, max_clusters, existing
             ], style={'fontSize': '0.9em'})
         ])
         
-        return {'display': 'block'}, cluster_assignments, info_div, {'display': 'block'}
+        return {'display': 'block'}, cluster_assignments, info_div, {'display': 'block'}, {'display': 'block'}
     
     # Show controls when vector type changes (but don't re-cluster)
     if trigger_id == 'vector-type':
         viz_style = {'display': 'block'} if existing_assignments else {'display': 'none'}
-        return {'display': 'block'}, existing_assignments, "", viz_style
+        return {'display': 'block'}, existing_assignments, "", viz_style, {'display': 'none'}
     
     return {'display': 'none'}, existing_assignments, "", {'display': 'none'}
+
+# Function to generate sequence description from cluster assignments
+def generate_sequence_description(peak_frames, cluster_assignments):
+    """
+    Generate a description of the video as a sequence of step types (clusters) over time.
+    
+    Args:
+        peak_frames: Dictionary of peak frames data
+        cluster_assignments: Dictionary mapping peak indices to cluster assignments
+        
+    Returns:
+        Dictionary containing sequence description data
+    """
+    if not peak_frames or not cluster_assignments:
+        return None
+    
+    # Create a list of (time, cluster) tuples
+    time_cluster_pairs = []
+    for peak_idx, frame_data in peak_frames.items():
+        if str(peak_idx) in cluster_assignments:
+            cluster_id = cluster_assignments[str(peak_idx)]
+            time_cluster_pairs.append((frame_data['time'], cluster_id))
+    
+    # Sort by time
+    time_cluster_pairs.sort()
+    
+    # Extract the sequence
+    times = [pair[0] for pair in time_cluster_pairs]
+    clusters = [pair[1] for pair in time_cluster_pairs]
+    
+    # Generate a text description
+    sequence_text = "Cluster sequence: " + " → ".join([f"{c}" for c in clusters])
+    
+    # Count transitions between clusters
+    transitions = {}
+    for i in range(len(clusters) - 1):
+        from_cluster = clusters[i]
+        to_cluster = clusters[i+1]
+        transition_key = f"{from_cluster}→{to_cluster}"
+        transitions[transition_key] = transitions.get(transition_key, 0) + 1
+    
+    # Find most common transitions
+    sorted_transitions = sorted(transitions.items(), key=lambda x: x[1], reverse=True)
+    common_transitions = sorted_transitions[:min(5, len(sorted_transitions))]
+    
+    # Count occurrences of each cluster
+    cluster_counts = {}
+    for c in clusters:
+        cluster_counts[c] = cluster_counts.get(c, 0) + 1
+    
+    # Sort clusters by frequency
+    sorted_clusters = sorted(cluster_counts.items(), key=lambda x: x[1], reverse=True)
+    
+    # Generate summary statistics
+    total_steps = len(clusters)
+    unique_clusters = len(cluster_counts)
+    most_common = sorted_clusters[0][0] if sorted_clusters else None
+    most_common_count = sorted_clusters[0][1] if sorted_clusters else 0
+    most_common_pct = (most_common_count / total_steps * 100) if total_steps > 0 else 0
+    
+    # Create a summary
+    summary = f"Video contains {total_steps} steps across {unique_clusters} different step types.\n"
+    summary += f"Most common step type: Cluster {most_common} ({most_common_count} occurrences, {most_common_pct:.1f}%).\n\n"
+    
+    # Add cluster distribution
+    summary += "Step type distribution:\n"
+    for cluster, count in sorted_clusters:
+        pct = (count / total_steps * 100)
+        summary += f"  Cluster {cluster}: {count} steps ({pct:.1f}%)\n"
+    
+    # Add common transitions
+    if common_transitions:
+        summary += "\nCommon transitions between step types:\n"
+        for transition, count in common_transitions:
+            summary += f"  {transition}: {count} times\n"
+    
+    return {
+        'sequence_text': sequence_text,
+        'sequence': clusters,
+        'times': times,
+        'summary': summary,
+        'cluster_counts': cluster_counts,
+        'transitions': transitions
+    }
 
 # Callback to update peak frames gallery with cluster colors
 @callback(
@@ -1528,6 +1624,107 @@ def update_peak_frames_gallery(peak_frames, cluster_assignments, frame_view):
         frame_elements.append(thumbnail)
     
     return frame_elements
+
+# Callback to handle sequence description button
+@callback(
+    [Output('sequence-description', 'data'),
+     Output('sequence-description-display', 'children'),
+     Output('sequence-timeline', 'figure'),
+     Output('sequence-description-section', 'style', allow_duplicate=True)],
+    [Input('generate-sequence-btn', 'n_clicks')],
+    [State('peak-frames', 'data'),
+     State('cluster-assignments', 'data')],
+    prevent_initial_call=True
+)
+def handle_sequence_description(n_clicks, peak_frames, cluster_assignments):
+    if not n_clicks or not peak_frames or not cluster_assignments:
+        return None, "No sequence data available.", {}, {'display': 'none'}
+    
+    # Generate sequence description
+    sequence_data = generate_sequence_description(peak_frames, cluster_assignments)
+    if not sequence_data:
+        return None, "Could not generate sequence description.", {}, {'display': 'none'}
+    
+    # Create text display
+    text_display = [
+        html.H5("Sequence Summary"),
+        html.Pre(sequence_data['summary'], style={'backgroundColor': '#f8f9fa', 'padding': '10px', 'borderRadius': '5px'}),
+        html.H5("Step Sequence"),
+        html.Div(sequence_data['sequence_text'], style={'marginBottom': '10px'})
+    ]
+    
+    # Create timeline visualization
+    sequence = sequence_data['sequence']
+    times = sequence_data['times']
+    
+    # Define color palette for clusters
+    cluster_colors = [
+        '#FF6B6B', '#4ECDC4', '#45B7D1', '#FFA07A', '#98D8C8',
+        '#F7DC6F', '#BB8FCE', '#85C1E2', '#F8B739', '#E74C3C'
+    ]
+    
+    # Create a figure for the timeline
+    fig = go.Figure()
+    
+    # Add vertical lines for each step
+    for i, (time, cluster) in enumerate(zip(times, sequence)):
+        color = cluster_colors[cluster % len(cluster_colors)]
+        fig.add_trace(go.Scatter(
+            x=[time, time],
+            y=[0, 1],
+            mode='lines',
+            line=dict(color=color, width=2),
+            showlegend=False,
+            hoverinfo='text',
+            hovertext=f"Time: {time:.2f}s<br>Cluster: {cluster}"
+        ))
+        
+        # Add marker at the top
+        fig.add_trace(go.Scatter(
+            x=[time],
+            y=[1],
+            mode='markers',
+            marker=dict(color=color, size=10),
+            showlegend=False,
+            hoverinfo='text',
+            hovertext=f"Time: {time:.2f}s<br>Cluster: {cluster}"
+        ))
+    
+    # Add cluster labels
+    unique_clusters = sorted(set(sequence))
+    for cluster in unique_clusters:
+        color = cluster_colors[cluster % len(cluster_colors)]
+        # Find first occurrence of this cluster for the legend
+        first_idx = sequence.index(cluster)
+        fig.add_trace(go.Scatter(
+            x=[times[first_idx]],
+            y=[1.1],
+            mode='markers',
+            marker=dict(color=color, size=10),
+            name=f"Cluster {cluster}",
+            hoverinfo='name'
+        ))
+    
+    # Update layout
+    fig.update_layout(
+        title="Step Sequence Timeline",
+        xaxis_title="Time (seconds)",
+        yaxis=dict(
+            showticklabels=False,
+            range=[-0.1, 1.2]
+        ),
+        margin=dict(l=20, r=20, t=40, b=30),
+        hovermode="closest",
+        legend=dict(
+            orientation="h",
+            yanchor="bottom",
+            y=1.02,
+            xanchor="right",
+            x=1
+        )
+    )
+    
+    return sequence_data, text_display, fig, {'display': 'block'}
 
 # Callback to create cluster visualization and silhouette plot
 @callback(
@@ -2563,7 +2760,7 @@ def find_next_maximum(data, current_index, peaks):
 # Function to perform pose estimation on an image
 def perform_pose_estimation(image):
     """
-    Performs pose estimation on an image using MediaPipe.
+    Performs pose estimation on an image using MediaPipe with reduced face, hand, and foot vectors.
     
     Args:
         image: OpenCV image (BGR format)
@@ -2573,11 +2770,21 @@ def perform_pose_estimation(image):
         - annotated_image: Image with pose landmarks drawn
         - pose_vector: Flattened vector of pose landmarks (x, y, z, visibility for each landmark)
         - success: Boolean indicating if pose estimation was successful
+        
+    Note:
+        This function filters out most face, hand, and foot landmarks, keeping only:
+        - Face: only nose (0)
+        - Main body: shoulders (11-12), elbows (13-14), wrists (15-16), 
+                    hips (23-24), knees (25-26), ankles (27-28)
     """
     # Initialize MediaPipe Pose
     mp_pose = mp.solutions.pose
     mp_drawing = mp.solutions.drawing_utils
     mp_drawing_styles = mp.solutions.drawing_styles
+    
+    # Define which landmarks to keep (reduced face, hand, and foot vectors)
+    # 0: nose, 11-16: shoulders/elbows/wrists, 23-28: hips/knees/ankles
+    LANDMARKS_TO_KEEP = [0, 11, 12, 13, 14, 15, 16, 23, 24, 25, 26, 27, 28]
     
     # Convert to RGB for MediaPipe
     image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
@@ -2597,21 +2804,58 @@ def perform_pose_estimation(image):
         
         if results.pose_landmarks:
             success = True
-            # Extract landmarks into a flat vector
-            for landmark in results.pose_landmarks.landmark:
-                pose_vector.extend([landmark.x, landmark.y, landmark.z, landmark.visibility])
+            # Extract only the selected landmarks into a flat vector
+            for idx, landmark in enumerate(results.pose_landmarks.landmark):
+                if idx in LANDMARKS_TO_KEEP:
+                    pose_vector.extend([landmark.x, landmark.y, landmark.z, landmark.visibility])
             
             # Create annotated image
             annotated_image = image.copy()
-            mp_drawing.draw_landmarks(
-                annotated_image,
-                results.pose_landmarks,
-                mp_pose.POSE_CONNECTIONS,
-                landmark_drawing_spec=mp_drawing_styles.get_default_pose_landmarks_style())
+            
+            # Draw only the landmarks we want to keep
+            # We'll draw them individually as points
+            for idx in LANDMARKS_TO_KEEP:
+                landmark = results.pose_landmarks.landmark[idx]
+                # Convert normalized coordinates to pixel coordinates
+                x = int(landmark.x * image.shape[1])
+                y = int(landmark.y * image.shape[0])
+                # Draw a circle at the landmark position
+                cv2.circle(annotated_image, (x, y), 5, (0, 255, 0), -1)
+                
+            # Draw connections between landmarks we want to keep
+            # Define the connections we want to draw
+            connections = [
+                (0, 11), (0, 12),  # nose to shoulders
+                (11, 12),  # shoulder to shoulder
+                (11, 13), (13, 15),  # left arm
+                (12, 14), (14, 16),  # right arm
+                (11, 23), (12, 24),  # shoulders to hips
+                (23, 24),  # hip to hip
+                (23, 25), (25, 27),  # left leg
+                (24, 26), (26, 28)   # right leg
+            ]
+            
+            # Draw each connection
+            for connection in connections:
+                idx1, idx2 = connection
+                # Only draw if both landmarks are in our keep list
+                if idx1 in LANDMARKS_TO_KEEP and idx2 in LANDMARKS_TO_KEEP:
+                    landmark1 = results.pose_landmarks.landmark[idx1]
+                    landmark2 = results.pose_landmarks.landmark[idx2]
+                    
+                    # Convert normalized coordinates to pixel coordinates
+                    x1 = int(landmark1.x * image.shape[1])
+                    y1 = int(landmark1.y * image.shape[0])
+                    x2 = int(landmark2.x * image.shape[1])
+                    y2 = int(landmark2.y * image.shape[0])
+                    
+                    # Draw a line between the landmarks
+                    cv2.line(annotated_image, (x1, y1), (x2, y2), (0, 255, 0), 2)
         else:
             # If no landmarks detected, return the original image and an empty vector
             annotated_image = image
-            pose_vector = [0] * (33 * 4)  # 33 landmarks with x, y, z, visibility
+            # Only for the landmarks we're keeping (13 landmarks with x, y, z, visibility)
+            pose_vector = [0] * (len(LANDMARKS_TO_KEEP) * 4)
         
         return annotated_image, pose_vector, success
 
