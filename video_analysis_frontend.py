@@ -430,6 +430,7 @@ app.layout = html.Div([
     dcc.Store(id='cluster-centroids', data=None),
     dcc.Store(id='cosine-similarity-data', data=None),
     dcc.Store(id='full-video-pose-data', data=None),
+    dcc.Store(id='dtw-segmentation-data', data=None),
     
     # Main container
     html.Div([
@@ -457,6 +458,14 @@ app.layout = html.Div([
                                   className='btn btn-primary', 
                                   style={'background': '#10a37f', 'color': '#ffffff', 'fontWeight': '600', 
                                         'padding': '12px 24px', 'fontSize': '15px', 'cursor': 'pointer'}),
+                        html.Div([
+                            dcc.Checklist(
+                                id='delete-config-checkbox',
+                                options=[{'label': ' Restart eventfulness data', 'value': 'delete'}],
+                                value=[],
+                                style={'fontSize': '12px', 'color': '#8e8ea0', 'opacity': '0.8'}
+                            ),
+                        ], style={'marginTop': '8px'}),
                         html.Div(id='analysis-status', style={'marginTop': '12px', 'fontSize': '13px', 'color': '#8e8ea0', 'minHeight': '20px'}),
                     ], style={'textAlign': 'center', 'maxWidth': '1200px', 'margin': '0 auto'}),
                 ], className='analysis-control-section', id='analysis-control-section', style={'display': 'none'}),
@@ -506,6 +515,17 @@ app.layout = html.Div([
                         config={'displayModeBar': False, 'displaylogo': False}
                     ),
                 ], className='section-card', id='cosine-similarity-section', style={'display': 'none'}),
+                
+                # DTW segmentation section
+                html.Div([
+                    html.H3("DTW-Based Time Series Segmentation", style={'fontSize': '16px', 'fontWeight': '600', 'color': '#202123', 'marginBottom': '8px'}),
+                    html.Div(id='dtw-segmentation-info', style={'fontSize': '13px', 'color': '#8e8ea0', 'marginBottom': '12px'}),
+                    dcc.Graph(
+                        id='dtw-segmentation-graph',
+                        style={'height': '400px', 'width': '100%'},
+                        config={'displayModeBar': False, 'displaylogo': False}
+                    ),
+                ], className='section-card', id='dtw-segmentation-section', style={'display': 'none'}),
                 
             ], className='content-area'),
         ], className='main-layout'),
@@ -567,7 +587,10 @@ def update_video_list(current_video):
      Output('eventfulness-data', 'data'),
      Output('peak-frames', 'data', allow_duplicate=True),
      Output('cluster-assignments', 'data', allow_duplicate=True),
-     Output('cosine-similarity-data', 'data', allow_duplicate=True)],
+     Output('cosine-similarity-data', 'data', allow_duplicate=True),
+     Output('cluster-centroids', 'data', allow_duplicate=True),
+     Output('full-video-pose-data', 'data', allow_duplicate=True),
+     Output('analysis-status', 'children', allow_duplicate=True)],
     Input({'type': 'video-button', 'path': dash.ALL}, 'n_clicks'),
     State({'type': 'video-button', 'path': dash.ALL}, 'id'),
     State('current-video', 'data'),
@@ -578,12 +601,12 @@ def select_video(n_clicks, ids, current_video):
     # Use callback context to find which button was clicked
     ctx = dash.callback_context
     if not ctx.triggered:
-        return dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update
+        return dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update
     
     # Find the index of the clicked button
     triggered_prop = ctx.triggered[0]['prop_id']
     if not triggered_prop or '.n_clicks' not in triggered_prop:
-        return dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update
+        return dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update
     
     # Find which button was clicked by checking which n_clicks changed
     clicked_index = None
@@ -593,25 +616,25 @@ def select_video(n_clicks, ids, current_video):
             break
     
     if clicked_index is None or clicked_index >= len(ids):
-        return dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update
+        return dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update
     
     # Get the video path from the clicked button
     video_path = ids[clicked_index]['path']
     
     # If clicking the same video, don't reload
     if video_path == current_video:
-        return dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update
+        return dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update
     
     # Validate video path exists
     if not video_path or not os.path.exists(video_path):
         logger.error(f"Video file not found: {video_path}")
-        return dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update
+        return dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update
     
     # Get video info
     video_info = backend.get_video_info(video_path)
     if not video_info:
         logger.error(f"Failed to get video info for: {video_path}")
-        return video_path, None, None, None, None, None
+        return video_path, None, None, None, None, None, None, None, ""
     
     # Find matching config and eventfulness data
     config_path, config = backend.find_matching_config(video_path)
@@ -628,7 +651,8 @@ def select_video(n_clicks, ids, current_video):
     # Clear previous video's analysis data when switching videos
     logger.info(f"Switching to video: {video_path}")
     
-    return video_path, video_info, eventfulness_data, None, None, None
+    # Return new video data and clear all analysis data from previous video
+    return video_path, video_info, eventfulness_data, None, None, None, None, None, ""
 
 # Callback to update video info display
 @callback(
@@ -676,8 +700,8 @@ def update_video_player(video_path, video_info):
 
 # Callback to update eventfulness graph
 @callback(
-    [Output('eventfulness-graph', 'figure'),
-     Output('graph-section', 'style')],
+    [Output('eventfulness-graph', 'figure', allow_duplicate=True),
+     Output('graph-section', 'style', allow_duplicate=True)],
     [Input('eventfulness-data', 'data'),
      Input('video-info', 'data'),
      Input('current-video', 'data'),
@@ -685,7 +709,8 @@ def update_video_player(video_path, video_info):
      Input('graph-update-interval', 'n_intervals'),
      Input('peak-frames', 'data')],
     [State('video-player', 'playing'),
-     State('eventfulness-graph', 'figure')]
+     State('eventfulness-graph', 'figure')],
+    prevent_initial_call=True
 )
 def update_eventfulness_graph(eventfulness_data, video_info, current_video, current_time, n_intervals, peak_frames, playing, current_figure):
     """Update eventfulness graph with current video position."""
@@ -710,9 +735,16 @@ def update_eventfulness_graph(eventfulness_data, video_info, current_video, curr
     
     current_value = data[current_index] if current_index < len(data) else data[0]
     
-    # Always update the figure - don't skip updates when figure exists
-    # Detect peaks (only once, reuse if figure exists)
-    needs_new_figure = current_figure is None or 'data' not in current_figure or len(current_figure['data']) == 0
+    # Check if we need a new figure
+    # Force new figure if: no figure exists, video/eventfulness data changed, or peak_frames changed
+    ctx = dash.callback_context
+    triggered_id = ctx.triggered[0]['prop_id'].split('.')[0] if ctx.triggered else None
+    
+    # Create new figure if triggered by video change, eventfulness data change, or no figure exists
+    needs_new_figure = (current_figure is None or 
+                       'data' not in current_figure or 
+                       len(current_figure['data']) == 0 or
+                       triggered_id in ['eventfulness-data', 'current-video', 'peak-frames'])
     
     if needs_new_figure:
         # Initial graph creation - get peaks from peak_frames if available
@@ -857,28 +889,41 @@ def handle_video_playback(playing):
      Output('cluster-centroids', 'data', allow_duplicate=True),
      Output('cosine-similarity-data', 'data', allow_duplicate=True),
      Output('full-video-pose-data', 'data', allow_duplicate=True),
+     Output('dtw-segmentation-data', 'data', allow_duplicate=True),
      Output('analysis-status', 'children'),
      Output('graph-section', 'style', allow_duplicate=True),
      Output('peak-frames-section', 'style', allow_duplicate=True),
-     Output('cosine-similarity-section', 'style', allow_duplicate=True)],
+     Output('cosine-similarity-section', 'style', allow_duplicate=True),
+     Output('dtw-segmentation-section', 'style', allow_duplicate=True)],
     [Input('complete-analysis-btn', 'n_clicks')],
     [State('current-video', 'data'),
-     State('video-info', 'data')],
+     State('video-info', 'data'),
+     State('delete-config-checkbox', 'value')],
     prevent_initial_call=True
 )
-def run_complete_analysis(n_clicks, video_path, video_info):
+def run_complete_analysis(n_clicks, video_path, video_info, delete_config):
     """Run the complete analysis workflow from start to finish."""
     if not n_clicks or not video_path or not video_info:
-        return dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, "", {'display': 'none'}, {'display': 'none'}, {'display': 'none'}
+        return dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, "", {'display': 'none'}, {'display': 'none'}, {'display': 'none'}, {'display': 'none'}
     
     logger.info(f"Starting complete analysis for: {video_path}")
     
     try:
+        # Check if we should delete existing config.json
+        if delete_config and 'delete' in delete_config:
+            config_path, _ = backend.find_matching_config(video_path)
+            if config_path and os.path.exists(config_path):
+                try:
+                    os.remove(config_path)
+                    logger.info(f"Deleted existing config.json at: {config_path}")
+                except Exception as e:
+                    logger.warning(f"Failed to delete config.json: {str(e)}")
+        
         # Update status
         status_msg = html.Div("Starting complete analysis... This may take several minutes.", style={'color': '#10a37f'})
         
         # Run the complete analysis workflow
-        pose_data, eventfulness_data, peak_frames, centroids, similarities, cluster_assignments = backend.run_complete_analysis(
+        pose_data, eventfulness_data, peak_frames, centroids, similarities, cluster_assignments, dtw_segmentation = backend.run_complete_analysis(
             video_path, num_workers=4)
         
         # Update status based on results
@@ -886,6 +931,7 @@ def run_complete_analysis(n_clicks, video_path, video_info):
             status_msg = html.Div([
                 html.Div(f"✓ Analysis complete! Processed {len(pose_data)} frames, found {len(peak_frames)} peaks.", style={'color': '#10a37f', 'marginBottom': '4px'}),
                 html.Div(f"✓ Created {len(cluster_assignments) if cluster_assignments else 0} cluster assignments." if cluster_assignments else "⚠ No cluster assignments created.", style={'color': '#10a37f' if cluster_assignments else '#fbd38d'}),
+                html.Div(f"✓ DTW segmentation: {dtw_segmentation['num_clusters']} clusters segmented." if dtw_segmentation else "⚠ No DTW segmentation.", style={'color': '#10a37f' if dtw_segmentation else '#fbd38d', 'marginTop': '4px'}),
             ])
         elif pose_data:
             status_msg = html.Div("⚠ Analysis partially complete. Pose estimation finished, but eventfulness data or peaks not found.", style={'color': '#fbd38d'})
@@ -896,17 +942,18 @@ def run_complete_analysis(n_clicks, video_path, video_info):
         graph_style = {'display': 'block'} if eventfulness_data else {'display': 'none'}
         peak_style = {'display': 'block'} if peak_frames else {'display': 'none'}
         similarity_style = {'display': 'block'} if similarities and centroids else {'display': 'none'}
+        dtw_style = {'display': 'block'} if dtw_segmentation else {'display': 'none'}
         
-        logger.info(f"Complete analysis finished. Results: pose_data={bool(pose_data)}, eventfulness={bool(eventfulness_data)}, peaks={len(peak_frames) if peak_frames else 0}, clusters={len(cluster_assignments) if cluster_assignments else 0}")
+        logger.info(f"Complete analysis finished. Results: pose_data={bool(pose_data)}, eventfulness={bool(eventfulness_data)}, peaks={len(peak_frames) if peak_frames else 0}, clusters={len(cluster_assignments) if cluster_assignments else 0}, dtw={bool(dtw_segmentation)}")
         
-        return eventfulness_data, peak_frames, cluster_assignments, centroids, similarities, pose_data, status_msg, graph_style, peak_style, similarity_style
+        return eventfulness_data, peak_frames, cluster_assignments, centroids, similarities, pose_data, dtw_segmentation, status_msg, graph_style, peak_style, similarity_style, dtw_style
         
     except Exception as e:
         logger.error(f"Error in complete analysis: {str(e)}")
         import traceback
         logger.error(traceback.format_exc())
         status_msg = html.Div(f"✗ Error during analysis: {str(e)}", style={'color': '#ef4444'})
-        return None, None, None, None, None, None, status_msg, {'display': 'none'}, {'display': 'none'}, {'display': 'none'}
+        return None, None, None, None, None, None, None, status_msg, {'display': 'none'}, {'display': 'none'}, {'display': 'none'}, {'display': 'none'}
 
 # Callback to update peak frames gallery
 @callback(
@@ -1106,6 +1153,153 @@ def create_cosine_similarity_graph(similarities, centroids):
     )
     
     return fig, {'display': 'block'}
+
+# Callback to visualize DTW segmentation results
+@callback(
+    [Output('dtw-segmentation-graph', 'figure'),
+     Output('dtw-segmentation-info', 'children'),
+     Output('dtw-segmentation-section', 'style')],
+    [Input('dtw-segmentation-data', 'data'),
+     Input('cosine-similarity-data', 'data'),
+     Input('cluster-centroids', 'data')]
+)
+def visualize_dtw_segmentation(dtw_data, similarities, centroids):
+    """Create visualization of DTW segmentation results with GLOBAL segments across all clusters."""
+    if not dtw_data or not similarities or not centroids:
+        return dash.no_update, "", {'display': 'none'}
+    
+    # Extract frame numbers and times from similarities
+    frame_numbers = []
+    times = []
+    similarity_data = {cluster_id: [] for cluster_id in centroids.keys()}
+    
+    for frame_idx, data in similarities.items():
+        frame_numbers.append(data['frame_number'])
+        times.append(data['time'])
+        
+        for cluster_id, score in data['similarities'].items():
+            similarity_data[cluster_id].append(score)
+    
+    # Define color palette
+    cluster_colors = [
+        '#10a37f', '#8e8ea0', '#202123', '#565869', '#a5a5b1',
+        '#353740', '#6b7280', '#9ca3af', '#d1d5db', '#e5e7eb'
+    ]
+    
+    # Create figure with subplots for each cluster
+    from plotly.subplots import make_subplots
+    
+    num_clusters = len(centroids)
+    fig = make_subplots(
+        rows=num_clusters, 
+        cols=1,
+        subplot_titles=[f'Cluster {cid}' for cid in sorted(centroids.keys())],
+        vertical_spacing=0.08,
+        shared_xaxes=True
+    )
+    
+    # Get GLOBAL change points and segments (not per-cluster)
+    change_points = dtw_data.get('change_points', [])
+    segments = dtw_data.get('segments', [])
+    
+    # Plot each cluster's similarity with GLOBAL segment boundaries
+    for i, cluster_id in enumerate(sorted(centroids.keys())):
+        row = i + 1
+        color = cluster_colors[int(cluster_id) % len(cluster_colors)]
+        
+        # Add similarity trace
+        fig.add_trace(
+            go.Scatter(
+                x=frame_numbers,
+                y=similarity_data[cluster_id],
+                mode='lines',
+                name=f'Cluster {cluster_id}',
+                line=dict(color=color, width=2),
+                opacity=0.7,
+                showlegend=False,
+                hovertemplate=f'<b>Cluster {cluster_id}</b><br>Frame: %{{x}}<br>Similarity: %{{y:.3f}}<extra></extra>'
+            ),
+            row=row, col=1
+        )
+        
+        # Add GLOBAL segment boundaries as vertical lines (same for all clusters)
+        for cp_idx in change_points[1:-1]:  # Skip first and last
+            # Map change point index to frame number
+            if cp_idx < len(frame_numbers):
+                frame_num = frame_numbers[cp_idx]
+                fig.add_vline(
+                    x=frame_num,
+                    line_dash="dash",
+                    line_color="rgba(255, 0, 0, 0.5)",
+                    line_width=2,
+                    row=row, col=1
+                )
+        
+        # Add segment labels (only on first row to avoid clutter)
+        if row == 1:
+            for seg in segments:
+                mid_frame = (seg['start_frame'] + seg['end_frame']) // 2
+                # Find max similarity across all clusters for positioning
+                max_sim = max(max(similarity_data[cid]) for cid in centroids.keys())
+                fig.add_annotation(
+                    x=mid_frame,
+                    y=max_sim * 0.95,
+                    text=f"<b>Segment {seg['segment_id']}</b>",
+                    showarrow=False,
+                    font=dict(size=11, color='#202123'),
+                    bgcolor='rgba(255, 255, 255, 0.8)',
+                    bordercolor='#e5e5e5',
+                    borderwidth=1,
+                    borderpad=4,
+                    row=row, col=1
+                )
+    
+    # Update layout
+    fig.update_layout(
+        height=150 * num_clusters + 100,
+        showlegend=False,
+        margin=dict(l=50, r=30, t=50, b=40),
+        hovermode='closest',
+        plot_bgcolor='#ffffff',
+        paper_bgcolor='#ffffff',
+        font=dict(family='-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif', size=12)
+    )
+    
+    # Update axes
+    fig.update_xaxes(
+        title_text='Frame Number',
+        titlefont=dict(size=13, color='#8e8ea0'),
+        tickfont=dict(size=12, color='#8e8ea0'),
+        gridcolor='#f0f0f0',
+        zeroline=False,
+        showline=False,
+        row=num_clusters, col=1
+    )
+    
+    for i in range(1, num_clusters + 1):
+        fig.update_yaxes(
+            title_text='Similarity',
+            titlefont=dict(size=11, color='#8e8ea0'),
+            tickfont=dict(size=10, color='#8e8ea0'),
+            gridcolor='#f0f0f0',
+            zeroline=False,
+            showline=False,
+            row=i, col=1
+        )
+    
+    # Create info text
+    total_segments = len(segments)
+    params = dtw_data['parameters']
+    info_text = html.Div([
+        html.Span(f"Method: Vector-based DTW | ", style={'marginRight': '8px', 'fontWeight': '600'}),
+        html.Span(f"Global Segments: {total_segments} | ", style={'marginRight': '8px'}),
+        html.Span(f"Window: {params['window_size']} | ", style={'marginRight': '8px'}),
+        html.Span(f"Threshold: {params['threshold']} | ", style={'marginRight': '8px'}),
+        html.Span(f"Min Length: {params['min_segment_length']} | ", style={'marginRight': '8px'}),
+        html.Span(f"Dimensions: {params.get('vector_dimensions', 'N/A')}", style={'marginRight': '8px'}),
+    ])
+    
+    return fig, info_text, {'display': 'block'}
 
 # Add route for video serving
 @server.route('/video')

@@ -64,7 +64,8 @@ def find_matching_config(video_path):
     config_files = glob.glob(os.path.join(
         RESULTS_DIR, "**/config.json"), recursive=True)
 
-    video_path_normalized = os.path.normpath(video_path)
+    # Use realpath to resolve symlinks for proper path comparison
+    video_path_normalized = os.path.realpath(video_path)
     video_filename = os.path.basename(video_path)
 
     for config_file in config_files:
@@ -76,7 +77,8 @@ def find_matching_config(video_path):
                 config_video_path = config["video_path"]
                 config_video_filename = os.path.basename(config_video_path)
 
-                if (os.path.normpath(config_video_path) == video_path_normalized or
+                # Use realpath to resolve symlinks for proper path comparison
+                if (os.path.realpath(config_video_path) == video_path_normalized or
                         config_video_filename == video_filename):
                     return config_file, config
         except Exception:

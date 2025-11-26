@@ -23,6 +23,21 @@ logging.basicConfig(
 )
 logger = logging.getLogger('video_analysis')
 
+# DTW imports - try dtaidistance first, fallback to scipy
+try:
+    from dtaidistance import dtw
+    DTW_LIBRARY = 'dtaidistance'
+    logger.info("Using dtaidistance library for DTW computations")
+except ImportError:
+    try:
+        from scipy.spatial.distance import euclidean
+        from scipy.ndimage import uniform_filter1d
+        DTW_LIBRARY = 'scipy'
+        logger.info("dtaidistance not available, using scipy for DTW computations")
+    except ImportError:
+        DTW_LIBRARY = None
+        logger.warning("No DTW library available. DTW segmentation will not be available.")
+
 # Define constants
 RESULTS_DIR = "/home/is1893/Mirror2/dataSets/test_data/results"
 
@@ -70,7 +85,8 @@ class VideoAnalysisBackend:
         config_files = glob.glob(os.path.join(
             RESULTS_DIR, "**/config.json"), recursive=True)
             
-        video_path_normalized = os.path.normpath(video_path)
+        # Use realpath to resolve symlinks for proper path comparison
+        video_path_normalized = os.path.realpath(video_path)
         video_filename = os.path.basename(video_path)
         
         for config_file in config_files:
@@ -82,7 +98,8 @@ class VideoAnalysisBackend:
                     config_video_path = config["video_path"]
                     config_video_filename = os.path.basename(config_video_path)
                     
-                    if (os.path.normpath(config_video_path) == video_path_normalized or
+                    # Use realpath to resolve symlinks for proper path comparison
+                    if (os.path.realpath(config_video_path) == video_path_normalized or
                             config_video_filename == video_filename):
                         return config_file, config
             except Exception as e:
@@ -91,7 +108,7 @@ class VideoAnalysisBackend:
                 
         return None, None
     
-    def perform_pose_estimation(self, image, draw=False, normalize_centroid=False):
+    def perform_pose_estimation(self, image, draw=False, normalize_centroid=True):
         """
         Performs pose estimation on an image using MediaPipe with reduced face, hand, and foot vectors.
         
@@ -264,8 +281,12 @@ class VideoAnalysisBackend:
                 # Calculate time in seconds
                 time = frame_number / fps if fps > 0 else 0
                 
-                # Perform pose estimation without normalization
-                _, pose_vector, pose_detected = self.perform_pose_estimation(
+                # Perform pose estimation WITH normalization (for cosine similarity)
+                _, pose_vector_normalized, pose_detected = self.perform_pose_estimation(
+                    frame, draw=False, normalize_centroid=True)
+                
+                # Perform pose estimation WITHOUT normalization (for clustering)
+                _, pose_vector_raw, _ = self.perform_pose_estimation(
                     frame, draw=False, normalize_centroid=False)
                 
                 # Store the pose data
@@ -273,7 +294,8 @@ class VideoAnalysisBackend:
                     pose_data[str(frame_number)] = {
                         'frame_number': frame_number,
                         'time': time,
-                        'pose_vector': pose_vector,
+                        'pose_vector': pose_vector_normalized,  # For cosine similarity
+                        'pose_vector_raw': pose_vector_raw,     # For clustering
                     }
                     
             # Increment frame counter
@@ -368,17 +390,23 @@ class VideoAnalysisBackend:
                     peak_indices.append(peak_idx)
                     
             elif vector_type == 'pose':
-                # Use pose vector only
-                feature_vector = frame_info.get('pose_vector', None)
+                # Use RAW (non-normalized) pose vector for clustering
+                feature_vector = frame_info.get('pose_vector_raw', None)
+                # Fallback to normalized if raw not available (backward compatibility)
+                if feature_vector is None:
+                    feature_vector = frame_info.get('pose_vector', None)
                 pose_detected = frame_info.get('pose_detected', False)
                 if feature_vector is not None and pose_detected:
                     vectors.append(feature_vector)
                     peak_indices.append(peak_idx)
                     
             elif vector_type == 'combined':
-                # Use both eventfulness and pose vectors
+                # Use both eventfulness and RAW (non-normalized) pose vectors for clustering
                 eventfulness_vector = frame_info.get('eventfulness_vector', None)
-                pose_vector = frame_info.get('pose_vector', None)
+                pose_vector = frame_info.get('pose_vector_raw', None)
+                # Fallback to normalized if raw not available (backward compatibility)
+                if pose_vector is None:
+                    pose_vector = frame_info.get('pose_vector', None)
                 pose_detected = frame_info.get('pose_detected', False)
                 
                 if eventfulness_vector is not None and pose_vector is not None and pose_detected:
@@ -501,25 +529,244 @@ class VideoAnalysisBackend:
             logger.error(f"Error during clustering: {str(e)}")
             return None, None
     
+    def evaluate_cluster_quality(self, peak_frames, cluster_assignments, vector_type='pose'):
+        """
+        Evaluates the quality of clusters and identifies outliers/noisy data points.
+        
+        Uses multiple metrics:
+        1. Silhouette coefficient per sample (measures how well each point fits its cluster)
+        2. Distance to cluster centroid (identifies points far from cluster center)
+        3. Cluster cohesion (intra-cluster distance)
+        4. Cluster separation (inter-cluster distance)
+        
+        Args:
+            peak_frames: Dictionary of peak frames with vectors
+            cluster_assignments: Dictionary mapping peak indices to cluster IDs
+            vector_type: Type of vector used for clustering ('pose', 'eventfulness', 'combined')
+            
+        Returns:
+            Dictionary with cluster quality metrics and outlier identification
+        """
+        from sklearn.metrics import silhouette_samples
+        from scipy.spatial.distance import cdist
+        
+        if not peak_frames or not cluster_assignments:
+            return None
+            
+        # Extract vectors and labels in the same order
+        vectors = []
+        peak_indices = []
+        labels = []
+        
+        for peak_idx, frame_info in peak_frames.items():
+            if str(peak_idx) not in cluster_assignments:
+                continue
+                
+            # Get the appropriate vector based on vector_type
+            if vector_type == 'pose':
+                feature_vector = frame_info.get('pose_vector_raw', None)
+                if feature_vector is None:
+                    feature_vector = frame_info.get('pose_vector', None)
+            elif vector_type == 'eventfulness':
+                feature_vector = frame_info.get('eventfulness_vector', None)
+            elif vector_type == 'combined':
+                ev = frame_info.get('eventfulness_vector', None)
+                pv = frame_info.get('pose_vector_raw', None) or frame_info.get('pose_vector', None)
+                if ev and pv:
+                    feature_vector = ev + pv
+                else:
+                    feature_vector = None
+            else:
+                feature_vector = None
+                
+            if feature_vector is not None:
+                vectors.append(feature_vector)
+                peak_indices.append(peak_idx)
+                labels.append(cluster_assignments[str(peak_idx)])
+        
+        if len(vectors) < 2:
+            return None
+            
+        # Convert to numpy arrays
+        X = np.array(vectors)
+        labels_array = np.array(labels)
+        
+        # Standardize (same as during clustering)
+        scaler = StandardScaler()
+        X_scaled = scaler.fit_transform(X)
+        
+        # 1. Calculate silhouette coefficient for each sample
+        silhouette_vals = silhouette_samples(X_scaled, labels_array)
+        
+        # 2. Calculate cluster centroids
+        unique_labels = np.unique(labels_array)
+        centroids = {}
+        for label in unique_labels:
+            cluster_points = X_scaled[labels_array == label]
+            centroids[label] = np.mean(cluster_points, axis=0)
+        
+        # 3. Calculate distance of each point to its cluster centroid
+        distances_to_centroid = []
+        for i, label in enumerate(labels_array):
+            centroid = centroids[label]
+            distance = np.linalg.norm(X_scaled[i] - centroid)
+            distances_to_centroid.append(distance)
+        distances_to_centroid = np.array(distances_to_centroid)
+        
+        # 4. Calculate cluster-level metrics
+        cluster_metrics = {}
+        for label in unique_labels:
+            cluster_mask = labels_array == label
+            cluster_points = X_scaled[cluster_mask]
+            cluster_silhouettes = silhouette_vals[cluster_mask]
+            cluster_distances = distances_to_centroid[cluster_mask]
+            
+            # Intra-cluster cohesion (average distance to centroid)
+            cohesion = np.mean(cluster_distances)
+            
+            # Cluster size
+            size = np.sum(cluster_mask)
+            
+            # Average silhouette for this cluster
+            avg_silhouette = np.mean(cluster_silhouettes)
+            
+            cluster_metrics[int(label)] = {
+                'size': int(size),
+                'cohesion': float(cohesion),
+                'avg_silhouette': float(avg_silhouette),
+                'avg_distance_to_centroid': float(np.mean(cluster_distances)),
+                'std_distance_to_centroid': float(np.std(cluster_distances)),
+                'min_silhouette': float(np.min(cluster_silhouettes)),
+                'max_silhouette': float(np.max(cluster_silhouettes))
+            }
+        
+        # 5. Identify outliers using multiple criteria
+        outlier_info = {}
+        for i, peak_idx in enumerate(peak_indices):
+            label = labels_array[i]
+            silhouette_val = silhouette_vals[i]
+            distance = distances_to_centroid[i]
+            
+            # Calculate z-score for distance within cluster
+            cluster_distances = distances_to_centroid[labels_array == label]
+            mean_dist = np.mean(cluster_distances)
+            std_dist = np.std(cluster_distances)
+            z_score = (distance - mean_dist) / std_dist if std_dist > 0 else 0
+            
+            # Determine if point is an outlier based on multiple criteria
+            is_outlier = False
+            outlier_reasons = []
+            
+            # Criterion 1: Negative silhouette (point is closer to another cluster)
+            if silhouette_val < 0:
+                is_outlier = True
+                outlier_reasons.append('negative_silhouette')
+            
+            # Criterion 2: Very low silhouette (poorly clustered)
+            elif silhouette_val < 0.1:
+                is_outlier = True
+                outlier_reasons.append('low_silhouette')
+            
+            # Criterion 3: High z-score (far from cluster centroid)
+            if z_score > 2.5:
+                is_outlier = True
+                outlier_reasons.append('high_distance')
+            
+            outlier_info[peak_idx] = {
+                'cluster_id': int(label),
+                'silhouette': float(silhouette_val),
+                'distance_to_centroid': float(distance),
+                'z_score': float(z_score),
+                'is_outlier': is_outlier,
+                'outlier_reasons': outlier_reasons,
+                'quality_score': float(silhouette_val)  # Overall quality (higher is better)
+            }
+        
+        # 6. Calculate overall clustering quality
+        overall_silhouette = np.mean(silhouette_vals)
+        num_outliers = sum(1 for info in outlier_info.values() if info['is_outlier'])
+        outlier_percentage = (num_outliers / len(outlier_info)) * 100 if len(outlier_info) > 0 else 0
+        
+        quality_report = {
+            'overall_silhouette': float(overall_silhouette),
+            'num_samples': len(vectors),
+            'num_clusters': len(unique_labels),
+            'num_outliers': num_outliers,
+            'outlier_percentage': float(outlier_percentage),
+            'cluster_metrics': cluster_metrics,
+            'outlier_info': outlier_info
+        }
+        
+        logger.info(f"Cluster Quality: Silhouette={overall_silhouette:.3f}, Outliers={num_outliers}/{len(vectors)} ({outlier_percentage:.1f}%)")
+        
+        return quality_report
+    
+    def filter_outliers_from_clusters(self, peak_frames, cluster_assignments, quality_report):
+        """
+        Filters out outlier data points from cluster assignments based on quality metrics.
+        
+        Args:
+            peak_frames: Dictionary of peak frames
+            cluster_assignments: Original cluster assignments
+            quality_report: Quality report from evaluate_cluster_quality()
+            
+        Returns:
+            Filtered cluster assignments (outliers removed), outlier assignments
+        """
+        if not quality_report or 'outlier_info' not in quality_report:
+            return cluster_assignments, {}
+            
+        filtered_assignments = {}
+        outlier_assignments = {}
+        
+        for peak_idx_str, cluster_id in cluster_assignments.items():
+            peak_idx = int(peak_idx_str) if isinstance(peak_idx_str, str) else peak_idx_str
+            
+            if peak_idx in quality_report['outlier_info']:
+                outlier_data = quality_report['outlier_info'][peak_idx]
+                
+                if outlier_data['is_outlier']:
+                    # Mark as outlier
+                    outlier_assignments[peak_idx_str] = {
+                        'original_cluster': cluster_id,
+                        'silhouette': outlier_data['silhouette'],
+                        'reasons': outlier_data['outlier_reasons']
+                    }
+                else:
+                    # Keep in filtered assignments
+                    filtered_assignments[peak_idx_str] = cluster_id
+            else:
+                # Keep if not evaluated
+                filtered_assignments[peak_idx_str] = cluster_id
+        
+        logger.info(f"Filtered clusters: Kept {len(filtered_assignments)}, Removed {len(outlier_assignments)} outliers")
+        
+        return filtered_assignments, outlier_assignments
+    
     def calculate_cluster_centroids(self, peak_frames, cluster_assignments):
         """
         Calculates the centroid pose vector for each cluster.
+        Uses NORMALIZED pose vectors to match what will be compared in cosine similarity.
+        
+        Note: Clustering uses raw (non-normalized) vectors, but centroids are calculated
+        from normalized vectors for proper cosine similarity comparison.
         
         Args:
             peak_frames: Dictionary of peak frames with pose vectors
             cluster_assignments: Dictionary mapping peak indices to cluster IDs
             
         Returns:
-            Dictionary mapping cluster IDs to centroid pose vectors
+            Dictionary mapping cluster IDs to centroid pose vectors (normalized)
         """
         if not peak_frames or not cluster_assignments:
             return {}
             
-        # Group pose vectors by cluster
+        # Group NORMALIZED pose vectors by cluster (for cosine similarity)
         clusters = {}
         for peak_idx, frame_info in peak_frames.items():
             if str(peak_idx) in cluster_assignments and frame_info.get('pose_detected', False):
                 cluster_id = cluster_assignments[str(peak_idx)]
+                # Use normalized pose vector for centroid (matches cosine similarity space)
                 pose_vector = frame_info.get('pose_vector', None)
                 
                 if pose_vector is not None:
@@ -551,7 +798,7 @@ class VideoAnalysisBackend:
         Returns:
             Dictionary mapping frame numbers to similarity scores for each cluster
         """
-        if not pose_data or not cluster_centroids:
+        if not pose_data or cluster_centroids is None or len(cluster_centroids) == 0:
             return {}
             
         # Dictionary to store similarity scores
@@ -559,7 +806,12 @@ class VideoAnalysisBackend:
         
         # Convert centroids to numpy array
         centroid_ids = sorted(cluster_centroids.keys())
-        centroid_vectors = np.array([cluster_centroids[cid] for cid in centroid_ids])
+        try:
+            centroid_vectors = np.array([cluster_centroids[cid] for cid in centroid_ids])
+            logger.info(f"Centroid vectors shape: {centroid_vectors.shape}, dtype: {centroid_vectors.dtype}")
+        except Exception as e:
+            logger.error(f"Error converting centroids to numpy array: {str(e)}")
+            return {}
         
         # Get all frame indices and sort them
         frame_indices = sorted(pose_data.keys(), key=lambda x: pose_data[x]['frame_number'])
@@ -576,6 +828,9 @@ class VideoAnalysisBackend:
                 pose_vector = frame_data.get('pose_vector', None)
                 
                 if pose_vector is not None:
+                    # Ensure pose_vector is a list, not a numpy array
+                    if isinstance(pose_vector, np.ndarray):
+                        pose_vector = pose_vector.tolist()
                     batch_vectors.append(pose_vector)
                     batch_data.append((frame_idx, frame_data))
             
@@ -583,10 +838,17 @@ class VideoAnalysisBackend:
                 continue
                 
             # Convert to numpy array
-            batch_vectors_array = np.array(batch_vectors)
-            
-            # Compute cosine similarity for the entire batch at once
-            sim_scores_batch = cosine_similarity(batch_vectors_array, centroid_vectors)
+            try:
+                batch_vectors_array = np.array(batch_vectors)
+                logger.info(f"Batch vectors shape: {batch_vectors_array.shape}, Centroid vectors shape: {centroid_vectors.shape}")
+                
+                # Compute cosine similarity for the entire batch at once
+                sim_scores_batch = cosine_similarity(batch_vectors_array, centroid_vectors)
+            except Exception as e:
+                logger.error(f"Error computing cosine similarity for batch: {str(e)}")
+                logger.error(f"Batch vectors type: {type(batch_vectors[0]) if batch_vectors else 'empty'}")
+                logger.error(f"Centroid vectors type: {type(centroid_vectors)}")
+                raise
             
             # Store results
             for j, (frame_idx, frame_data) in enumerate(batch_data):
@@ -602,7 +864,478 @@ class VideoAnalysisBackend:
                 
         return similarities
     
-    def handle_full_video_analysis(self, video_path, peak_frames=None, cluster_assignments=None, num_workers=4, existing_pose_data=None):
+    def smooth_cosine_similarities(self, similarities, window_size=5):
+        """
+        Applies a running average (moving average) to smooth cosine similarity values.
+        
+        Args:
+            similarities: Dictionary mapping frame numbers to similarity scores
+            window_size: Size of the moving average window (default: 5)
+            
+        Returns:
+            Dictionary with smoothed similarity scores
+        """
+        if not similarities or window_size < 1:
+            return similarities
+            
+        # Sort frames by frame number
+        sorted_frames = sorted(similarities.keys(), key=lambda x: similarities[x]['frame_number'])
+        
+        if len(sorted_frames) < window_size:
+            logger.warning(f"Not enough frames ({len(sorted_frames)}) for smoothing window size {window_size}")
+            return similarities
+            
+        # Get cluster IDs from first frame
+        first_frame = sorted_frames[0]
+        cluster_ids = list(similarities[first_frame]['similarities'].keys())
+        
+        # Create smoothed similarities dictionary
+        smoothed_similarities = {}
+        
+        # For each cluster, smooth its similarity values across frames
+        for cluster_id in cluster_ids:
+            # Extract similarity values for this cluster across all frames
+            similarity_values = []
+            for frame_idx in sorted_frames:
+                sim_value = similarities[frame_idx]['similarities'].get(cluster_id, 0.0)
+                similarity_values.append(sim_value)
+            
+            # Apply moving average
+            smoothed_values = []
+            for i in range(len(similarity_values)):
+                # Calculate window bounds
+                start_idx = max(0, i - window_size // 2)
+                end_idx = min(len(similarity_values), i + window_size // 2 + 1)
+                
+                # Compute average over window
+                window_values = similarity_values[start_idx:end_idx]
+                smoothed_value = np.mean(window_values)
+                smoothed_values.append(smoothed_value)
+            
+            # Store smoothed values back
+            for i, frame_idx in enumerate(sorted_frames):
+                if frame_idx not in smoothed_similarities:
+                    smoothed_similarities[frame_idx] = {
+                        'frame_number': similarities[frame_idx]['frame_number'],
+                        'time': similarities[frame_idx]['time'],
+                        'similarities': {},
+                        'similarities_raw': similarities[frame_idx]['similarities'].copy()  # Keep original
+                    }
+                smoothed_similarities[frame_idx]['similarities'][cluster_id] = float(smoothed_values[i])
+        
+        logger.info(f"Applied moving average smoothing with window size {window_size} to {len(sorted_frames)} frames")
+        return smoothed_similarities
+    
+    def compute_dtw_distance(self, series1, series2, window=None):
+        """
+        Computes Dynamic Time Warping (DTW) distance between two time series.
+        
+        Args:
+            series1: First time series (numpy array or list)
+            series2: Second time series (numpy array or list)
+            window: Sakoe-Chiba window constraint (optional)
+            
+        Returns:
+            DTW distance (normalized by series length)
+        """
+        if DTW_LIBRARY is None:
+            logger.error("No DTW library available. Cannot compute DTW distance.")
+            return float('inf')
+        
+        series1 = np.array(series1)
+        series2 = np.array(series2)
+        
+        if DTW_LIBRARY == 'dtaidistance':
+            # Use dtaidistance library for efficient DTW
+            try:
+                if window is not None:
+                    distance = dtw.distance(series1, series2, window=window)
+                else:
+                    distance = dtw.distance(series1, series2)
+                # Normalize by average length
+                normalized_distance = distance / ((len(series1) + len(series2)) / 2)
+                return normalized_distance
+            except Exception as e:
+                logger.error(f"Error computing DTW with dtaidistance: {str(e)}")
+                return float('inf')
+        
+        elif DTW_LIBRARY == 'scipy':
+            # Fallback: implement basic DTW using dynamic programming
+            n, m = len(series1), len(series2)
+            
+            # Initialize DTW matrix
+            dtw_matrix = np.full((n + 1, m + 1), float('inf'))
+            dtw_matrix[0, 0] = 0
+            
+            # Apply window constraint if specified
+            if window is None:
+                window = max(n, m)
+            
+            # Fill DTW matrix
+            for i in range(1, n + 1):
+                for j in range(max(1, i - window), min(m + 1, i + window + 1)):
+                    cost = abs(series1[i-1] - series2[j-1])
+                    dtw_matrix[i, j] = cost + min(
+                        dtw_matrix[i-1, j],      # insertion
+                        dtw_matrix[i, j-1],      # deletion
+                        dtw_matrix[i-1, j-1]     # match
+                    )
+            
+            # Normalize by path length (average of both series lengths)
+            normalized_distance = dtw_matrix[n, m] / ((n + m) / 2)
+            return normalized_distance
+        
+        return float('inf')
+    
+    def detect_dtw_change_points(self, time_series, window_size=10, threshold=1.5, min_segment_length=5):
+        """
+        Detects change points in a univariate time series using DTW distance between sliding windows.
+        
+        Args:
+            time_series: 1D numpy array or list of time series values
+            window_size: Size of the sliding window for comparison
+            threshold: Threshold multiplier for detecting change points (relative to median DTW)
+            min_segment_length: Minimum number of frames between change points
+            
+        Returns:
+            List of change point indices
+        """
+        if DTW_LIBRARY is None:
+            logger.warning("No DTW library available. Returning simple segmentation.")
+            return [0, len(time_series)]
+        
+        time_series = np.array(time_series)
+        n = len(time_series)
+        
+        # Need at least 2*window_size points for meaningful comparison
+        if n < 2 * window_size:
+            logger.warning(f"Time series too short ({n} points) for window size {window_size}")
+            return [0, n]
+        
+        # Compute DTW distances between consecutive windows
+        dtw_distances = []
+        positions = []
+        
+        # Slide window and compute DTW between adjacent windows
+        step_size = max(1, window_size // 2)  # 50% overlap
+        
+        for i in range(0, n - 2 * window_size + 1, step_size):
+            window1 = time_series[i:i + window_size]
+            window2 = time_series[i + window_size:i + 2 * window_size]
+            
+            # Compute DTW distance between windows
+            distance = self.compute_dtw_distance(window1, window2, window=window_size)
+            dtw_distances.append(distance)
+            positions.append(i + window_size)  # Change point at window boundary
+        
+        if not dtw_distances:
+            return [0, n]
+        
+        dtw_distances = np.array(dtw_distances)
+        
+        # Detect peaks in DTW distances (potential change points)
+        # Use threshold relative to median + threshold * std
+        median_dtw = np.median(dtw_distances)
+        std_dtw = np.std(dtw_distances)
+        dtw_threshold = median_dtw + threshold * std_dtw
+        
+        logger.info(f"DTW distances - median: {median_dtw:.4f}, std: {std_dtw:.4f}, threshold: {dtw_threshold:.4f}")
+        
+        # Find change points where DTW distance exceeds threshold
+        change_points = [0]  # Always start with 0
+        
+        for i, (pos, dist) in enumerate(zip(positions, dtw_distances)):
+            if dist > dtw_threshold:
+                # Check if far enough from last change point
+                if pos - change_points[-1] >= min_segment_length:
+                    change_points.append(pos)
+        
+        # Always end with the last index
+        if change_points[-1] != n:
+            change_points.append(n)
+        
+        logger.info(f"Detected {len(change_points) - 1} segments with {len(change_points) - 2} change points")
+        
+        return change_points
+    
+    def detect_dtw_change_points_vector(self, vector_time_series, window_size=10, threshold=1.5, min_segment_length=5):
+        """
+        Detects change points in a MULTIVARIATE time series using DTW distance between sliding windows.
+        
+        This treats each time point as a vector (e.g., similarity to all clusters) and compares
+        windows of vectors using multivariate DTW distance.
+        
+        Args:
+            vector_time_series: 2D numpy array (n_timepoints × n_dimensions)
+            window_size: Size of the sliding window for comparison
+            threshold: Threshold multiplier for detecting change points (relative to median DTW)
+            min_segment_length: Minimum number of frames between change points
+            
+        Returns:
+            List of change point indices
+        """
+        if DTW_LIBRARY is None:
+            logger.warning("No DTW library available. Returning simple segmentation.")
+            return [0, len(vector_time_series)]
+        
+        vector_time_series = np.array(vector_time_series)
+        n = len(vector_time_series)
+        
+        # Need at least 2*window_size points for meaningful comparison
+        if n < 2 * window_size:
+            logger.warning(f"Time series too short ({n} points) for window size {window_size}")
+            return [0, n]
+        
+        # Compute DTW distances between consecutive windows of vectors
+        dtw_distances = []
+        positions = []
+        
+        # Slide window and compute DTW between adjacent windows
+        step_size = max(1, window_size // 2)  # 50% overlap
+        
+        for i in range(0, n - 2 * window_size + 1, step_size):
+            window1 = vector_time_series[i:i + window_size]  # Shape: (window_size, n_dims)
+            window2 = vector_time_series[i + window_size:i + 2 * window_size]
+            
+            # Compute multivariate DTW distance
+            distance = self.compute_multivariate_dtw_distance(window1, window2, window=window_size)
+            dtw_distances.append(distance)
+            positions.append(i + window_size)  # Change point at window boundary
+        
+        if not dtw_distances:
+            return [0, n]
+        
+        dtw_distances = np.array(dtw_distances)
+        
+        # Detect peaks in DTW distances (potential change points)
+        median_dtw = np.median(dtw_distances)
+        std_dtw = np.std(dtw_distances)
+        dtw_threshold = median_dtw + threshold * std_dtw
+        
+        logger.info(f"Vector DTW distances - median: {median_dtw:.4f}, std: {std_dtw:.4f}, threshold: {dtw_threshold:.4f}")
+        
+        # Find change points where DTW distance exceeds threshold
+        change_points = [0]  # Always start with 0
+        
+        for i, (pos, dist) in enumerate(zip(positions, dtw_distances)):
+            if dist > dtw_threshold:
+                # Check if far enough from last change point
+                if pos - change_points[-1] >= min_segment_length:
+                    change_points.append(pos)
+        
+        # Always end with the last index
+        if change_points[-1] != n:
+            change_points.append(n)
+        
+        logger.info(f"Detected {len(change_points) - 1} segments with {len(change_points) - 2} change points")
+        
+        return change_points
+    
+    def compute_multivariate_dtw_distance(self, series1, series2, window=None):
+        """
+        Computes DTW distance between two MULTIVARIATE time series.
+        
+        Args:
+            series1: 2D array (n_timepoints1 × n_dimensions)
+            series2: 2D array (n_timepoints2 × n_dimensions)
+            window: Sakoe-Chiba window constraint (optional)
+            
+        Returns:
+            DTW distance (normalized)
+        """
+        if DTW_LIBRARY is None:
+            return float('inf')
+        
+        series1 = np.array(series1)
+        series2 = np.array(series2)
+        
+        # For multivariate DTW, we compute DTW on each dimension and aggregate
+        # This is a common approach: sum or average DTW distances across dimensions
+        
+        if len(series1.shape) == 1:
+            # Univariate case
+            return self.compute_dtw_distance(series1, series2, window)
+        
+        n_dims = series1.shape[1]
+        total_distance = 0.0
+        
+        for dim in range(n_dims):
+            dim_distance = self.compute_dtw_distance(series1[:, dim], series2[:, dim], window)
+            total_distance += dim_distance
+        
+        # Average across dimensions for normalized comparison
+        avg_distance = total_distance / n_dims
+        
+        return avg_distance
+    
+    def merge_nearby_change_points(self, change_points, min_distance):
+        """
+        Merges change points that are too close together.
+        
+        Args:
+            change_points: List of change point indices
+            min_distance: Minimum distance between change points
+            
+        Returns:
+            Filtered list of change points
+        """
+        if len(change_points) <= 2:
+            return change_points
+        
+        merged = [change_points[0]]
+        
+        for i in range(1, len(change_points) - 1):
+            if change_points[i] - merged[-1] >= min_distance:
+                merged.append(change_points[i])
+        
+        # Always keep the last point
+        merged.append(change_points[-1])
+        
+        return merged
+    
+    def create_segments_from_boundaries(self, change_points, frame_numbers, times):
+        """
+        Creates segment objects from change point boundaries.
+        
+        Args:
+            change_points: List of change point indices (in time series space)
+            frame_numbers: List of actual frame numbers corresponding to time series
+            times: List of timestamps corresponding to frames
+            
+        Returns:
+            List of segment dictionaries
+        """
+        segments = []
+        
+        for i in range(len(change_points) - 1):
+            start_idx = change_points[i]
+            end_idx = change_points[i + 1]
+            
+            # Map to actual frame numbers
+            start_frame = frame_numbers[start_idx]
+            end_frame = frame_numbers[min(end_idx, len(frame_numbers) - 1)]
+            
+            # Get timestamps
+            start_time = times[start_idx]
+            end_time = times[min(end_idx, len(times) - 1)]
+            
+            segment = {
+                'segment_id': i,
+                'start_frame': int(start_frame),
+                'end_frame': int(end_frame),
+                'start_time': float(start_time),
+                'end_time': float(end_time),
+                'duration': float(end_time - start_time),
+                'num_frames': int(end_idx - start_idx)
+            }
+            
+            segments.append(segment)
+        
+        return segments
+    
+    def segment_cosine_similarity_with_dtw(self, similarities, window_size=10, threshold=1.5, min_segment_length=5):
+        """
+        Segments cosine similarity time series using DTW-based change point detection.
+        
+        This method treats the cosine similarities as a MULTIVARIATE time series (vector at each time point)
+        and finds global change points where the overall similarity pattern changes, rather than
+        segmenting each cluster independently.
+        
+        Args:
+            similarities: Dictionary mapping frame indices to similarity scores
+                         (output from compute_cosine_similarities or smooth_cosine_similarities)
+            window_size: Size of sliding window for DTW comparison (default: 10)
+            threshold: Threshold multiplier for change detection (default: 1.5)
+            min_segment_length: Minimum frames per segment (default: 5)
+            
+        Returns:
+            Dictionary containing segmentation results:
+            {
+                'method': 'dtw_change_detection_vector',
+                'segments': [segment_dicts],  # Global segments
+                'change_points': [indices],    # Global change points
+                'parameters': {parameter_dict}
+            }
+        """
+        if not similarities:
+            logger.warning("No similarity data provided for DTW segmentation")
+            return None
+        
+        if DTW_LIBRARY is None:
+            logger.error("No DTW library available. Cannot perform DTW segmentation.")
+            return None
+        
+        logger.info(f"Starting vector-based DTW segmentation with window_size={window_size}, "
+                   f"threshold={threshold}, min_segment_length={min_segment_length}")
+        
+        # Extract and sort frames by frame number
+        sorted_frames = sorted(similarities.items(), 
+                              key=lambda x: similarities[x[0]]['frame_number'])
+        
+        if not sorted_frames:
+            return None
+        
+        # Get cluster IDs from first frame
+        first_frame_key = sorted_frames[0][0]
+        cluster_ids = sorted(list(similarities[first_frame_key]['similarities'].keys()))
+        
+        # Extract frame numbers and times
+        frame_numbers = [similarities[frame_key]['frame_number'] for frame_key, _ in sorted_frames]
+        times = [similarities[frame_key]['time'] for frame_key, _ in sorted_frames]
+        
+        # Build multivariate time series: each row is a time point, each column is a cluster
+        vector_time_series = []
+        for frame_key, _ in sorted_frames:
+            vector = [similarities[frame_key]['similarities'].get(cid, 0.0) for cid in cluster_ids]
+            vector_time_series.append(vector)
+        
+        vector_time_series = np.array(vector_time_series)
+        logger.info(f"Created vector time series: shape {vector_time_series.shape} "
+                   f"({vector_time_series.shape[0]} frames × {vector_time_series.shape[1]} clusters)")
+        
+        # Detect change points using DTW on the vector time series
+        change_points = self.detect_dtw_change_points_vector(
+            vector_time_series,
+            window_size=window_size,
+            threshold=threshold,
+            min_segment_length=min_segment_length
+        )
+        
+        # Merge nearby change points
+        change_points = self.merge_nearby_change_points(change_points, min_segment_length)
+        
+        # Create segment objects
+        segments = self.create_segments_from_boundaries(
+            change_points,
+            frame_numbers,
+            times
+        )
+        
+        logger.info(f"Created {len(segments)} global segments from {len(change_points) - 2} change points")
+        
+        # Compile results
+        results = {
+            'method': 'dtw_change_detection_vector',
+            'segments': segments,  # Global segments (not per-cluster)
+            'change_points': change_points,  # Global change points
+            'cluster_ids': cluster_ids,
+            'parameters': {
+                'window_size': window_size,
+                'threshold': threshold,
+                'min_segment_length': min_segment_length,
+                'dtw_library': DTW_LIBRARY,
+                'vector_dimensions': len(cluster_ids)
+            },
+            'num_clusters': len(cluster_ids),
+            'total_frames': len(frame_numbers)
+        }
+        
+        logger.info(f"Vector-based DTW segmentation completed: {len(segments)} segments")
+        
+        return results
+    
+    def handle_full_video_analysis(self, video_path, peak_frames=None, cluster_assignments=None, num_workers=4, existing_pose_data=None, 
+                                   perform_dtw_segmentation=False, dtw_window_size=10, dtw_threshold=1.5, dtw_min_segment_length=5):
         """
         Performs full video analysis with pose estimation, clustering, and similarity calculation.
         Uses parallel processing for improved performance.
@@ -613,6 +1346,10 @@ class VideoAnalysisBackend:
             cluster_assignments: Dictionary of cluster assignments (optional)
             num_workers: Number of parallel workers
             existing_pose_data: Existing pose data to avoid reprocessing the entire video (optional)
+            perform_dtw_segmentation: Whether to perform DTW-based segmentation on similarity time series (default: False)
+            dtw_window_size: Window size for DTW segmentation (default: 10)
+            dtw_threshold: Threshold for DTW change detection (default: 1.5)
+            dtw_min_segment_length: Minimum segment length for DTW (default: 5)
             
         Returns:
             Tuple containing:
@@ -620,6 +1357,7 @@ class VideoAnalysisBackend:
             - centroids: Dictionary of cluster centroids
             - similarities: Dictionary of cosine similarities
             - cluster_assignments: Dictionary of cluster assignments
+            - dtw_segmentation: Dictionary of DTW segmentation results (None if not performed)
         """
         # Log the start of processing
         if peak_frames:
@@ -639,11 +1377,11 @@ class VideoAnalysisBackend:
             
             # Step 1: Perform pose estimation
             if existing_pose_data:
-                logger.info("Step 1/4: Using existing pose data, skipping pose estimation...")
+                logger.info("Step 1/5: Using existing pose data, skipping pose estimation...")
                 pose_data = existing_pose_data
                 logger.info(f"Using existing pose data with {len(pose_data)} frames")
             elif peak_frames and not existing_pose_data:
-                logger.info("Step 1/4: Performing pose estimation only on peak frames...")
+                logger.info("Step 1/5: Performing pose estimation only on peak frames...")
                 # Extract frame numbers from peak frames
                 peak_frame_numbers = [info['frame_number'] for info in peak_frames.values() if 'frame_number' in info]
                 if not peak_frame_numbers:
@@ -665,7 +1403,7 @@ class VideoAnalysisBackend:
                         if ret:
                             time = frame_number / fps if fps > 0 else 0
                             _, pose_vector, pose_detected = self.perform_pose_estimation(
-                                frame, draw=False, normalize_centroid=False)
+                                frame, draw=False, normalize_centroid=True)
                             if pose_detected:
                                 pose_data[str(frame_number)] = {
                                     'frame_number': frame_number,
@@ -675,7 +1413,7 @@ class VideoAnalysisBackend:
                     cap.release()
                     logger.info(f"Completed pose estimation on {len(pose_data)} peak frames")
             else:
-                logger.info("Step 1/4: Starting pose estimation on the entire video...")
+                logger.info("Step 1/5: Starting pose estimation on the entire video...")
                 pose_data = self.perform_full_video_pose_estimation(
                     video_path, video_info, sample_rate, num_workers=num_workers)
                 logger.info(f"Completed pose estimation on {len(pose_data)} frames")
@@ -686,7 +1424,7 @@ class VideoAnalysisBackend:
             
             # Step 2: If we don't have cluster assignments but we have peak frames, perform clustering
             if peak_frames and not cluster_assignments:
-                logger.info(f"Step 2/4: No existing clusters found. Performing clustering on {len(peak_frames)} peak frames...")
+                logger.info(f"Step 2/5: No existing clusters found. Performing clustering on {len(peak_frames)} peak frames...")
                 # Use default max_clusters=40 and vector_type='pose'
                 cluster_assignments, cluster_info = self.cluster_eventfulness_vectors(
                     peak_frames, max_clusters=40, vector_type='pose')
@@ -699,12 +1437,35 @@ class VideoAnalysisBackend:
                     if cluster_info and 'silhouette_score' in cluster_info:
                         logger.info(f"Silhouette Score: {cluster_info['silhouette_score']:.4f}")
                         logger.info(f"Cluster distribution: {dict([(c, list(cluster_assignments.values()).count(c)) for c in set(cluster_assignments.values())])}")
+                    
+                    # Evaluate cluster quality and filter outliers
+                    logger.info("Step 2b/5: Evaluating cluster quality and filtering outliers...")
+                    quality_report = self.evaluate_cluster_quality(peak_frames, cluster_assignments, vector_type='pose')
+                    
+                    if quality_report:
+                        # Filter out outliers
+                        filtered_assignments, outlier_assignments = self.filter_outliers_from_clusters(
+                            peak_frames, cluster_assignments, quality_report)
+                        
+                        # Update cluster_assignments to filtered version
+                        cluster_assignments = filtered_assignments
+                        
+                        # Log quality metrics
+                        logger.info(f"Cluster Quality Metrics:")
+                        logger.info(f"  Overall Silhouette: {quality_report['overall_silhouette']:.3f}")
+                        logger.info(f"  Outliers Removed: {quality_report['num_outliers']} ({quality_report['outlier_percentage']:.1f}%)")
+                        
+                        # Log per-cluster metrics
+                        for cluster_id, metrics in quality_report['cluster_metrics'].items():
+                            logger.info(f"  Cluster {cluster_id}: size={metrics['size']}, "
+                                      f"silhouette={metrics['avg_silhouette']:.3f}, "
+                                      f"cohesion={metrics['cohesion']:.3f}")
                 else:
                     logger.warning("Clustering failed - no cluster assignments were created")
             
             # Step 3: Calculate cluster centroids
             if peak_frames and cluster_assignments:
-                logger.info("Step 3/4: Calculating cluster centroids...")
+                logger.info("Step 3/5: Calculating cluster centroids...")
                 centroids = self.calculate_cluster_centroids(peak_frames, cluster_assignments)
                 if centroids:
                     logger.info(f"Calculated centroids for {len(centroids)} clusters")
@@ -720,17 +1481,43 @@ class VideoAnalysisBackend:
                 
                 # Step 4: Compute cosine similarities with batched processing
                 if pose_data and centroids:
-                    logger.info(f"Step 4/4: Computing cosine similarities for {len(pose_data)} frames against {len(centroids)} clusters...")
+                    logger.info(f"Step 4/5: Computing cosine similarities for {len(pose_data)} frames against {len(centroids)} clusters...")
                     similarities = self.compute_cosine_similarities(pose_data, centroids, batch_size=1000)
                     logger.info(f"Computed cosine similarities for {len(similarities)} frames")
+                    
+                    # Step 5: Smooth cosine similarities with running average
+                    logger.info("Step 5/5: Smoothing cosine similarities with running average...")
+                    similarities = self.smooth_cosine_similarities(similarities, window_size=5)
+                    logger.info(f"Smoothed cosine similarities for {len(similarities)} frames")
+                    
+                    # Optional Step 6: Perform DTW-based segmentation
+                    dtw_segmentation = None
+                    if perform_dtw_segmentation and similarities:
+                        logger.info("Step 6/6: Performing DTW-based segmentation on similarity time series...")
+                        dtw_segmentation = self.segment_cosine_similarity_with_dtw(
+                            similarities,
+                            window_size=dtw_window_size,
+                            threshold=dtw_threshold,
+                            min_segment_length=dtw_min_segment_length
+                        )
+                        if dtw_segmentation:
+                            logger.info(f"DTW segmentation completed: {dtw_segmentation['num_clusters']} clusters, "
+                                      f"{dtw_segmentation['total_frames']} frames")
+                        else:
+                            logger.warning("DTW segmentation failed")
+                    else:
+                        dtw_segmentation = None
                 else:
                     logger.warning(f"Skipping similarity calculation - pose_data: {bool(pose_data)}, centroids: {bool(centroids)}")
+                    dtw_segmentation = None
+            else:
+                dtw_segmentation = None
             
-            return pose_data, centroids, similarities, cluster_assignments
+            return pose_data, centroids, similarities, cluster_assignments, dtw_segmentation
             
         except Exception as e:
             logger.error(f"Error in full video analysis: {str(e)}")
-            return None, None, None, cluster_assignments
+            return None, None, None, cluster_assignments, None
     
     def run_complete_analysis(self, video_path, num_workers=4):
         """
@@ -825,7 +1612,7 @@ class VideoAnalysisBackend:
                             break
                         
                         logger.info("Still waiting for eventfulness results...")
-                        time.sleep(30)  # Check every 30 seconds
+                        time.sleep(1)  # Check every 30 seconds
                 else:
                     logger.info("Pose estimation took longer than expected, checking for results now...")
                     config_path, config = self.find_matching_config(video_path)
@@ -879,13 +1666,32 @@ class VideoAnalysisBackend:
                 logger.info(f"Eventfulness data loaded: {len(data)} data points")
                 
                 # Detect local maxima (peaks) using scipy's find_peaks
-                # This matches the dash app's detect_local_maxima() function
+                # First detect all potential peaks with minimal filtering
                 from scipy.signal import find_peaks
-                peaks, properties = find_peaks(data, height=0.3, distance=5)
-                peaks = [int(peak) for peak in peaks]
-                peak_values = [data[p] for p in peaks]
+                all_peaks, properties = find_peaks(data, distance=1)
                 
-                logger.info(f"Detected {len(peaks)} peaks using find_peaks (height=0.3, distance=5)")
+                # Calculate peak values
+                all_peak_values = [data[p] for p in all_peaks]
+                
+                # Select top percentage of peaks (default: top 30%)
+                peak_percentage = 1.0  # Can be adjusted (0.0 to 1.0)
+                num_peaks_to_keep = max(1, int(len(all_peaks) * peak_percentage))
+                
+                # Sort peaks by their values (heights) in descending order
+                peak_value_pairs = list(zip(all_peaks, all_peak_values))
+                peak_value_pairs.sort(key=lambda x: x[1], reverse=True)
+                
+                # Keep only the top percentage
+                top_peaks = peak_value_pairs[:num_peaks_to_keep]
+                
+                # Sort back by frame index for chronological order
+                top_peaks.sort(key=lambda x: x[0])
+                
+                # Extract final peaks and values
+                peaks = [int(p[0]) for p in top_peaks]
+                peak_values = [p[1] for p in top_peaks]
+                
+                logger.info(f"Detected {len(all_peaks)} total peaks, selected top {peak_percentage*100:.0f}% ({len(peaks)} peaks)")
                 if len(peaks) > 0:
                     logger.info(f"Peak indices: {peaks[:10]}{'...' if len(peaks) > 10 else ''}")
                     logger.info(f"Peak values range: [{min(peak_values):.3f}, {max(peak_values):.3f}]")
@@ -942,14 +1748,15 @@ class VideoAnalysisBackend:
                             cv2.imwrite(frame_path, frame)
                             
                             # Create annotated frame with pose landmarks
-                            annotated_frame, _, _ = self.perform_pose_estimation(frame, draw=True, normalize_centroid=False)
+                            annotated_frame, _, _ = self.perform_pose_estimation(frame, draw=True, normalize_centroid=True)
                             annotated_path = os.path.join(frame_dir, f"frame_{frame_number:06d}_annotated.jpg")
                             cv2.imwrite(annotated_path, annotated_frame)
                     
                     peak_frames[peak_idx] = {
                         'frame_number': frame_data['frame_number'],
                         'time': frame_data['time'],
-                        'pose_vector': frame_data['pose_vector'],
+                        'pose_vector': frame_data['pose_vector'],  # Normalized for cosine similarity
+                        'pose_vector_raw': frame_data.get('pose_vector_raw', frame_data['pose_vector']),  # Raw for clustering
                         'pose_detected': True,
                         'peak_value': eventfulness_value,
                         'eventfulness_value': eventfulness_value,
@@ -970,12 +1777,18 @@ class VideoAnalysisBackend:
             centroids = None
             similarities = None
             cluster_assignments = None
+            dtw_segmentation = None
             
             if peak_frames:
                 logger.info("Step 4/5: Performing clustering on peak frames...")
                 # Pass the existing pose_data to avoid reprocessing the entire video
-                _, centroids, similarities, cluster_assignments = self.handle_full_video_analysis(
-                    video_path, peak_frames=peak_frames, num_workers=num_workers, existing_pose_data=pose_data)
+                # Enable DTW segmentation automatically
+                _, centroids, similarities, cluster_assignments, dtw_segmentation = self.handle_full_video_analysis(
+                    video_path, peak_frames=peak_frames, num_workers=num_workers, existing_pose_data=pose_data,
+                    perform_dtw_segmentation=True,  # Enable DTW segmentation
+                    dtw_window_size=10,
+                    dtw_threshold=1.5,
+                    dtw_min_segment_length=5)
                 
                 if centroids:
                     logger.info(f"Created {len(centroids)} clusters")
@@ -991,17 +1804,24 @@ class VideoAnalysisBackend:
                     logger.info(f"Assigned {len(cluster_assignments)} peaks to clusters")
                 else:
                     logger.warning("No cluster assignments were made")
+                    
+                if dtw_segmentation:
+                    num_segments = len(dtw_segmentation.get('segments', []))
+                    logger.info(f"DTW segmentation completed: {dtw_segmentation['num_clusters']} clusters, "
+                              f"{num_segments} global segments")
+                else:
+                    logger.warning("No DTW segmentation results")
             else:
                 logger.info("Skipping clustering step - no peak frames available")
             
             logger.info("Complete analysis workflow finished")
-            return pose_data, eventfulness_data_dict, peak_frames, centroids, similarities, cluster_assignments
+            return pose_data, eventfulness_data_dict, peak_frames, centroids, similarities, cluster_assignments, dtw_segmentation
             
         except Exception as e:
             logger.error(f"Error in complete analysis workflow: {str(e)}")
             import traceback
             logger.error(traceback.format_exc())
-            return None, None, None, None, None, None
+            return None, None, None, None, None, None, None
 
 # Example usage (commented out - use run_complete_analysis method instead)
 # if __name__ == "__main__":
