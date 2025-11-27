@@ -432,6 +432,8 @@ app.layout = html.Div([
     dcc.Store(id='full-video-pose-data', data=None),
     dcc.Store(id='fluss-segmentation-data', data=None),
     dcc.Store(id='motif-visualization-data', data=None),
+    dcc.Store(id='pose-segmentation-data', data=None),
+    dcc.Store(id='peak-segmentation-data', data=None),
     
     # Main container
     html.Div([
@@ -501,40 +503,29 @@ app.layout = html.Div([
                     ),
                 ], className='section-card', id='graph-section', style={'display': 'none'}),
                 
+                # Pose Segmentation Visualizations section (NEW)
+                html.Div([
+                    html.H3("Pose-Based Video Segmentation", style={'fontSize': '16px', 'fontWeight': '600', 'color': '#202123', 'marginBottom': '8px'}),
+                    html.Div("Segments created from peak-to-peak analysis with recursive refinement", 
+                            style={'fontSize': '13px', 'color': '#8e8ea0', 'marginBottom': '12px'}),
+                    html.Div(id='pose-segmentation-info', style={'fontSize': '13px', 'color': '#10a37f', 'marginBottom': '16px', 'fontWeight': '500'}),
+                    html.Div(id='pose-segmentation-visualizations', style={'display': 'flex', 'flexDirection': 'column', 'gap': '20px'}),
+                ], className='section-card', id='pose-segmentation-section', style={'display': 'none'}),
+                
+                # Peak-Based Segmentation section (NEW)
+                html.Div([
+                    html.H3("Peak-Based Segmentation with Iterative Merging", style={'fontSize': '16px', 'fontWeight': '600', 'color': '#202123', 'marginBottom': '8px'}),
+                    html.Div("Segments created from eventfulness peaks, then merged based on similarity", 
+                            style={'fontSize': '13px', 'color': '#8e8ea0', 'marginBottom': '12px'}),
+                    html.Div(id='peak-segmentation-info', style={'fontSize': '13px', 'color': '#10a37f', 'marginBottom': '16px', 'fontWeight': '500'}),
+                    html.Div(id='peak-segmentation-visualization', style={'display': 'flex', 'flexDirection': 'column', 'gap': '20px'}),
+                ], className='section-card', id='peak-segmentation-section', style={'display': 'none'}),
+                
                 # Peak frames gallery section
                 html.Div([
                     html.H3("Peak Frames", style={'fontSize': '16px', 'fontWeight': '600', 'color': '#202123', 'marginBottom': '12px'}),
                     html.Div(id='peak-frames-gallery', className='gallery'),
                 ], className='section-card', id='peak-frames-section', style={'display': 'none'}),
-                
-                # Cosine similarity section
-                html.Div([
-                    html.H3("Cosine Similarity to Cluster Centroids", style={'fontSize': '16px', 'fontWeight': '600', 'color': '#202123', 'marginBottom': '16px'}),
-                    dcc.Graph(
-                        id='cosine-similarity-graph',
-                        style={'height': '300px', 'width': '100%'},
-                        config={'displayModeBar': False, 'displaylogo': False}
-                    ),
-                ], className='section-card', id='cosine-similarity-section', style={'display': 'none'}),
-                
-                # Motif visualization section
-                html.Div([
-                    html.H3("mSTUMP Motif Analysis", style={'fontSize': '16px', 'fontWeight': '600', 'color': '#202123', 'marginBottom': '8px'}),
-                    html.Div("Repeated patterns (motifs) identified by multivariate matrix profile analysis", 
-                            style={'fontSize': '13px', 'color': '#8e8ea0', 'marginBottom': '12px'}),
-                    html.Div(id='motif-images-container', style={'display': 'flex', 'flexDirection': 'column', 'gap': '16px'}),
-                ], className='section-card', id='motif-section', style={'display': 'none'}),
-                
-                # FLUSS segmentation section
-                html.Div([
-                    html.H3("FLUSS-Based Time Series Segmentation", style={'fontSize': '16px', 'fontWeight': '600', 'color': '#202123', 'marginBottom': '8px'}),
-                    html.Div(id='fluss-segmentation-info', style={'fontSize': '13px', 'color': '#8e8ea0', 'marginBottom': '12px'}),
-                    dcc.Graph(
-                        id='fluss-segmentation-graph',
-                        style={'height': '400px', 'width': '100%'},
-                        config={'displayModeBar': False, 'displaylogo': False}
-                    ),
-                ], className='section-card', id='fluss-segmentation-section', style={'display': 'none'}),
                 
             ], className='content-area'),
         ], className='main-layout'),
@@ -684,8 +675,7 @@ def update_video_info_display(video_path, video_info, eventfulness_data):
      Output('video-info-minimal', 'children'),
      Output('analysis-control-section', 'style'),
      Output('peak-frames-section', 'style', allow_duplicate=True),
-     Output('cosine-similarity-section', 'style', allow_duplicate=True),
-     Output('motif-section', 'style', allow_duplicate=True)],
+     Output('pose-segmentation-section', 'style', allow_duplicate=True)],
     [Input('current-video', 'data'),
      Input('video-info', 'data')],
     prevent_initial_call='initial_duplicate'
@@ -693,11 +683,11 @@ def update_video_info_display(video_path, video_info, eventfulness_data):
 def update_video_player(video_path, video_info):
     """Update video player and reset analysis sections when video changes."""
     if not video_path or not video_info:
-        return '', {'display': 'none'}, '', {'display': 'none'}, {'display': 'none'}, {'display': 'none'}, {'display': 'none'}
+        return '', {'display': 'none'}, '', {'display': 'none'}, {'display': 'none'}, {'display': 'none'}
     
     if not os.path.exists(video_path):
         logger.warning(f"Video file does not exist: {video_path}")
-        return '', {'display': 'none'}, '', {'display': 'none'}, {'display': 'none'}, {'display': 'none'}, {'display': 'none'}
+        return '', {'display': 'none'}, '', {'display': 'none'}, {'display': 'none'}, {'display': 'none'}
     
     # Create a data URL for the video
     video_url = f"/video?path={base64.b64encode(video_path.encode()).decode()}"
@@ -708,7 +698,7 @@ def update_video_player(video_path, video_info):
     
     # Show analysis control section and video section when video is loaded
     # Hide analysis sections when switching videos (graph-section is controlled by eventfulness callback)
-    return video_url, {'display': 'flex'}, info_text, {'display': 'block'}, {'display': 'none'}, {'display': 'none'}, {'display': 'none'}
+    return video_url, {'display': 'flex'}, info_text, {'display': 'block'}, {'display': 'none'}, {'display': 'none'}
 
 # Callback to update eventfulness graph
 @callback(
@@ -903,12 +893,12 @@ def handle_video_playback(playing):
      Output('full-video-pose-data', 'data', allow_duplicate=True),
      Output('fluss-segmentation-data', 'data', allow_duplicate=True),
      Output('motif-visualization-data', 'data', allow_duplicate=True),
+     Output('pose-segmentation-data', 'data', allow_duplicate=True),
+     Output('peak-segmentation-data', 'data', allow_duplicate=True),
      Output('analysis-status', 'children'),
      Output('graph-section', 'style', allow_duplicate=True),
      Output('peak-frames-section', 'style', allow_duplicate=True),
-     Output('cosine-similarity-section', 'style', allow_duplicate=True),
-     Output('motif-section', 'style', allow_duplicate=True),
-     Output('fluss-segmentation-section', 'style', allow_duplicate=True)],
+     Output('pose-segmentation-section', 'style', allow_duplicate=True)],
     [Input('complete-analysis-btn', 'n_clicks')],
     [State('current-video', 'data'),
      State('video-info', 'data'),
@@ -918,7 +908,7 @@ def handle_video_playback(playing):
 def run_complete_analysis(n_clicks, video_path, video_info, delete_config):
     """Run the complete analysis workflow from start to finish."""
     if not n_clicks or not video_path or not video_info:
-        return dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, "", {'display': 'none'}, {'display': 'none'}, {'display': 'none'}, {'display': 'none'}, {'display': 'none'}
+        return dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, "", {'display': 'none'}, {'display': 'none'}, {'display': 'none'}
     
     logger.info(f"Starting complete analysis for: {video_path}")
     
@@ -936,17 +926,52 @@ def run_complete_analysis(n_clicks, video_path, video_info, delete_config):
         # Update status
         status_msg = html.Div("Starting complete analysis... This may take several minutes.", style={'color': '#10a37f'})
         
-        # Run the complete analysis workflow (FLUSS segmentation enabled)
-        pose_data, eventfulness_data, peak_frames, centroids, similarities, cluster_assignments, fluss_segmentation = backend.run_complete_analysis(
+        # Run the complete analysis workflow (FLUSS segmentation and pose segmentation enabled)
+        pose_data, eventfulness_data, peak_frames, centroids, similarities, cluster_assignments, fluss_segmentation, pose_segmentation_results, peak_segmentation = backend.run_complete_analysis(
             video_path, num_workers=4)
         
-        # Update status based on results
+        # Update status based on results - focus on pose segmentation
         if pose_data and eventfulness_data and peak_frames:
-            status_msg = html.Div([
+            status_lines = [
                 html.Div(f"✓ Analysis complete! Processed {len(pose_data)} frames, found {len(peak_frames)} peaks.", style={'color': '#10a37f', 'marginBottom': '4px'}),
-                html.Div(f"✓ Created {len(cluster_assignments) if cluster_assignments else 0} cluster assignments." if cluster_assignments else "⚠ No cluster assignments created.", style={'color': '#10a37f' if cluster_assignments else '#fbd38d'}),
-                html.Div(f"✓ FLUSS segmentation: {fluss_segmentation['num_clusters']} clusters, {len(fluss_segmentation['segments'])} segments." if fluss_segmentation else "⚠ No FLUSS segmentation.", style={'color': '#10a37f' if fluss_segmentation else '#fbd38d', 'marginTop': '4px'}),
-            ])
+            ]
+            
+            # Add pose segmentation status if available
+            if pose_segmentation_results:
+                initial_count = len(pose_segmentation_results.get('initial_segments', []))
+                viz_count = len(pose_segmentation_results.get('visualizations', {}))
+                refined = pose_segmentation_results.get('refined_segments', {})
+                
+                status_lines.append(
+                    html.Div(f"✓ Pose Segmentation: {initial_count} initial segments created from peaks", 
+                            style={'color': '#10a37f', 'marginTop': '4px'})
+                )
+                
+                # Show refinement results
+                for strategy, results in refined.items():
+                    final_count = len(results.get('final_segments', []))
+                    status_lines.append(
+                        html.Div(f"  • {strategy}: {initial_count} → {final_count} segments", 
+                                style={'color': '#10a37f', 'marginLeft': '20px', 'fontSize': '0.9em'})
+                    )
+                
+                status_lines.append(
+                    html.Div(f"✓ Created {viz_count} visualization files", 
+                            style={'color': '#10a37f', 'marginTop': '4px'})
+                )
+            
+            # Add peak segmentation status if available
+            if peak_segmentation:
+                initial_count = peak_segmentation.get('initial_segment_count', 0)
+                final_count = peak_segmentation.get('final_segment_count', 0)
+                num_passes = peak_segmentation.get('merge_results', {}).get('num_passes', 0)
+                
+                status_lines.append(
+                    html.Div(f"✓ Peak-Based Segmentation: {initial_count} → {final_count} segments ({num_passes} passes)", 
+                            style={'color': '#10a37f', 'marginTop': '4px'})
+                )
+            
+            status_msg = html.Div(status_lines)
         elif pose_data:
             status_msg = html.Div("⚠ Analysis partially complete. Pose estimation finished, but eventfulness data or peaks not found.", style={'color': '#fbd38d'})
         else:
@@ -964,23 +989,183 @@ def run_complete_analysis(n_clicks, video_path, video_info, delete_config):
                 'timestamp': os.path.getmtime(motif_viz_path)
             }
         
-        # Determine which sections to show
+        # Determine which sections to show - hide clustering/FLUSS, show pose segmentation
         graph_style = {'display': 'block'} if eventfulness_data else {'display': 'none'}
         peak_style = {'display': 'block'} if peak_frames else {'display': 'none'}
-        similarity_style = {'display': 'block'} if similarities and centroids else {'display': 'none'}
-        motif_style = {'display': 'block'} if motif_viz_data else {'display': 'none'}
-        fluss_style = {'display': 'block'} if fluss_segmentation else {'display': 'none'}
+        pose_seg_style = {'display': 'block'} if pose_segmentation_results else {'display': 'none'}
         
-        logger.info(f"Complete analysis finished. Results: pose_data={bool(pose_data)}, eventfulness={bool(eventfulness_data)}, peaks={len(peak_frames) if peak_frames else 0}, clusters={len(cluster_assignments) if cluster_assignments else 0}, fluss={bool(fluss_segmentation)}, motifs={bool(motif_viz_data)}")
+        logger.info(f"Complete analysis finished. Results: pose_data={bool(pose_data)}, eventfulness={bool(eventfulness_data)}, peaks={len(peak_frames) if peak_frames else 0}, clusters={len(cluster_assignments) if cluster_assignments else 0}, fluss={bool(fluss_segmentation)}, motifs={bool(motif_viz_data)}, peak_seg={bool(peak_segmentation)}")
         
-        return eventfulness_data, peak_frames, cluster_assignments, centroids, similarities, pose_data, fluss_segmentation, motif_viz_data, status_msg, graph_style, peak_style, similarity_style, motif_style, fluss_style
+        return eventfulness_data, peak_frames, cluster_assignments, centroids, similarities, pose_data, fluss_segmentation, motif_viz_data, pose_segmentation_results, peak_segmentation, status_msg, graph_style, peak_style, pose_seg_style
         
     except Exception as e:
         logger.error(f"Error in complete analysis: {str(e)}")
         import traceback
         logger.error(traceback.format_exc())
         status_msg = html.Div(f"✗ Error during analysis: {str(e)}", style={'color': '#ef4444'})
-        return None, None, None, None, None, None, None, None, status_msg, {'display': 'none'}, {'display': 'none'}, {'display': 'none'}, {'display': 'none'}, {'display': 'none'}
+        return None, None, None, None, None, None, None, None, None, None, status_msg, {'display': 'none'}, {'display': 'none'}, {'display': 'none'}
+
+# Callback to update peak segmentation display
+@callback(
+    [Output('peak-segmentation-info', 'children'),
+     Output('peak-segmentation-visualization', 'children'),
+     Output('peak-segmentation-section', 'style')],
+    Input('peak-segmentation-data', 'data')
+)
+def update_peak_segmentation_display(peak_seg_data):
+    """Display peak-based segmentation results."""
+    if not peak_seg_data:
+        return "", html.Div("No peak segmentation data available.", 
+                          style={'color': '#8e8ea0', 'fontSize': '13px'}), {'display': 'none'}
+    
+    try:
+        # Extract info
+        initial_count = peak_seg_data.get('initial_segment_count', 0)
+        final_count = peak_seg_data.get('final_segment_count', 0)
+        num_passes = peak_seg_data.get('num_passes', 0)
+        num_merges = peak_seg_data.get('num_merges', 0)
+        
+        # Create info text
+        info_text = html.Div([
+            html.Div(f"Initial segments: {initial_count} | Final segments: {final_count}", 
+                    style={'marginBottom': '4px'}),
+            html.Div(f"Merge passes: {num_passes} | Total merges: {num_merges}", 
+                    style={'marginBottom': '4px'}),
+        ])
+        
+        # Display visualization if available
+        viz_path = peak_seg_data.get('visualization_path')
+        viz_content = []
+        
+        if viz_path and os.path.exists(viz_path):
+            # Encode image as base64
+            with open(viz_path, 'rb') as f:
+                encoded = base64.b64encode(f.read()).decode()
+            
+            viz_content.append(
+                html.Div([
+                    html.H4("Segmentation Results", 
+                           style={'fontSize': '14px', 'fontWeight': '600', 'marginBottom': '8px'}),
+                    html.Img(
+                        src=f'data:image/png;base64,{encoded}',
+                        style={'width': '100%', 'maxWidth': '1200px', 'borderRadius': '8px', 
+                              'border': '1px solid #e5e5e5'}
+                    )
+                ])
+            )
+        
+        # Display segment information
+        final_segments = peak_seg_data.get('final_segments', [])
+        if final_segments:
+            segment_info = []
+            for seg in final_segments[:10]:  # Show first 10 segments
+                seg_id = seg.get('segment_id', '?')
+                start_time = seg.get('start_time', 0)
+                end_time = seg.get('end_time', 0)
+                duration = seg.get('duration', 0)
+                merged_from = seg.get('merged_from', None)
+                
+                seg_text = f"Segment {seg_id}: {start_time:.2f}s - {end_time:.2f}s ({duration:.2f}s)"
+                if merged_from:
+                    seg_text += f" [merged from {merged_from}]"
+                
+                segment_info.append(
+                    html.Div(seg_text, style={'fontSize': '12px', 'color': '#353740', 
+                                             'padding': '4px 0', 'borderBottom': '1px solid #f0f0f0'})
+                )
+            
+            if len(final_segments) > 10:
+                segment_info.append(
+                    html.Div(f"... and {len(final_segments) - 10} more segments", 
+                            style={'fontSize': '12px', 'color': '#8e8ea0', 'padding': '4px 0', 'fontStyle': 'italic'})
+                )
+            
+            viz_content.append(
+                html.Div([
+                    html.H4("Final Segments", 
+                           style={'fontSize': '14px', 'fontWeight': '600', 'marginTop': '20px', 'marginBottom': '8px'}),
+                    html.Div(segment_info, style={'maxHeight': '300px', 'overflowY': 'auto'})
+                ])
+            )
+        
+        return info_text, html.Div(viz_content), {'display': 'block'}
+        
+    except Exception as e:
+        logger.error(f"Error displaying peak segmentation: {str(e)}")
+        return "", html.Div(f"Error displaying results: {str(e)}", 
+                          style={'color': '#ef4444', 'fontSize': '13px'}), {'display': 'block'}
+
+# Callback to update pose segmentation visualizations
+@callback(
+    [Output('pose-segmentation-info', 'children'),
+     Output('pose-segmentation-visualizations', 'children')],
+    Input('pose-segmentation-data', 'data')
+)
+def update_pose_segmentation_display(pose_seg_data):
+    """Display pose segmentation visualizations."""
+    if not pose_seg_data:
+        return "", html.Div("No pose segmentation data available.", 
+                           style={'textAlign': 'center', 'color': '#8e8ea0', 'padding': '40px'})
+    
+    # Extract info
+    initial_count = len(pose_seg_data.get('initial_segments', []))
+    refined = pose_seg_data.get('refined_segments', {})
+    visualizations = pose_seg_data.get('visualizations', {})
+    
+    # Create info summary
+    info_lines = [f"Created {initial_count} initial segments from eventfulness peaks"]
+    for strategy, results in refined.items():
+        final_count = len(results.get('final_segments', []))
+        info_lines.append(f" | {strategy}: {final_count} segments")
+    
+    info_text = " ".join(info_lines)
+    
+    # Create visualization elements
+    viz_elements = []
+    
+    # Define order and titles for visualizations
+    viz_order = [
+        ('timeline', 'Segmentation Timeline'),
+        ('iterative_merge_similar', '🎬 Step-by-Step: Merge Similar Strategy'),
+        ('iterative_hierarchical', '🎬 Step-by-Step: Hierarchical Strategy'),
+        ('iterative_boundary_refinement', '🎬 Step-by-Step: Boundary Refinement Strategy'),
+        ('similarity_matrix', 'Segment Similarity Matrix'),
+        ('threshold_analysis', 'Adaptive Threshold Analysis'),
+        ('statistics', 'Segment Statistics'),
+        ('pose_changes', 'Pose Change Detection'),
+        ('merge_history_merge_similar', 'Merge History Summary (Merge Similar)'),
+        ('merge_history_hierarchical', 'Merge History Summary (Hierarchical)'),
+        ('merge_history_boundary_refinement', 'Merge History Summary (Boundary Refinement)'),
+        ('comparisons', 'Segment Comparisons'),
+        ('segment_0', 'Segment 0 Creation Analysis'),
+    ]
+    
+    for viz_key, viz_title in viz_order:
+        if viz_key in visualizations:
+            viz_path = visualizations[viz_key]
+            if os.path.exists(viz_path):
+                # Convert to base64 for display
+                import base64
+                with open(viz_path, 'rb') as f:
+                    encoded = base64.b64encode(f.read()).decode()
+                
+                viz_elements.append(
+                    html.Div([
+                        html.H4(viz_title, style={'fontSize': '14px', 'fontWeight': '600', 
+                                                  'color': '#202123', 'marginBottom': '8px'}),
+                        html.Img(
+                            src=f'data:image/png;base64,{encoded}',
+                            style={'width': '100%', 'borderRadius': '4px', 
+                                  'boxShadow': '0 1px 3px rgba(0,0,0,0.1)'}
+                        ),
+                    ], style={'marginBottom': '20px'})
+                )
+    
+    if not viz_elements:
+        viz_elements = [html.Div("No visualizations found.", 
+                                style={'textAlign': 'center', 'color': '#8e8ea0', 'padding': '20px'})]
+    
+    return info_text, viz_elements
 
 # Callback to update peak frames gallery
 @callback(
@@ -1096,98 +1281,99 @@ def update_peak_frames_gallery(peak_frames, cluster_assignments):
     
     return frame_elements
 
-# Callback to create cosine similarity graph
-@callback(
-    [Output('cosine-similarity-graph', 'figure'),
-     Output('cosine-similarity-section', 'style')],
-    [Input('cosine-similarity-data', 'data'),
-     Input('cluster-centroids', 'data')]
-)
-def create_cosine_similarity_graph(similarities, centroids):
-    """Create cosine similarity graph."""
-    if not similarities or not centroids:
-        return dash.no_update, {'display': 'none'}
-    
-    # Extract frame numbers and similarity scores
-    frame_numbers = []
-    times = []
-    similarity_data = {cluster_id: [] for cluster_id in centroids.keys()}
-    
-    for frame_idx, data in similarities.items():
-        frame_numbers.append(data['frame_number'])
-        times.append(data['time'])
-        
-        for cluster_id, score in data['similarities'].items():
-            similarity_data[cluster_id].append(score)
-    
-    # Define minimal color palette for clusters (ChatGPT style)
-    cluster_colors = [
-        '#10a37f', '#8e8ea0', '#202123', '#565869', '#a5a5b1',
-        '#353740', '#6b7280', '#9ca3af', '#d1d5db', '#e5e7eb'
-    ]
-    
-    # Create figure
-    fig = go.Figure()
-    
-    # Add similarity traces with minimal styling
-    for i, (cluster_id, scores) in enumerate(similarity_data.items()):
-        color = cluster_colors[int(cluster_id) % len(cluster_colors)]
-        
-        fig.add_trace(go.Scatter(
-            x=frame_numbers,
-            y=scores,
-            mode='lines',
-            name=f'Cluster {cluster_id}',
-            line=dict(color=color, width=2),
-            opacity=0.7,
-            hoverinfo='y+x',
-            hovertemplate=f'<b>Cluster {cluster_id}</b><br>Frame: %{{x}}<br>Similarity: %{{y:.3f}}<extra></extra>'
-        ))
-    
-    # Update layout with ChatGPT-esque minimal styling
-    fig.update_layout(
-        showlegend=True,
-        xaxis=dict(
-            title='Frame Number',
-            titlefont=dict(size=13, color='#8e8ea0'),
-            tickfont=dict(size=12, color='#8e8ea0'),
-            gridcolor='#f0f0f0',
-            zeroline=False,
-            showline=False
-        ),
-        yaxis=dict(
-            title='Cosine Similarity',
-            titlefont=dict(size=13, color='#8e8ea0'),
-            tickfont=dict(size=12, color='#8e8ea0'),
-            gridcolor='#f0f0f0',
-            zeroline=False,
-            showline=False
-        ),
-        margin=dict(l=50, r=30, t=50, b=40),
-        hovermode='closest',
-        plot_bgcolor='#ffffff',
-        paper_bgcolor='#ffffff',
-        font=dict(family='-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif', size=12),
-        legend=dict(
-            orientation="h",
-            yanchor="bottom",
-            y=1.02,
-            xanchor="right",
-            x=1,
-            font=dict(size=11),
-            bgcolor='rgba(255,255,255,0.8)'
-        )
-    )
-    
-    return fig, {'display': 'block'}
+# Callback to create cosine similarity graph (DISABLED - not shown in UI)
+# Callback disabled - cosine similarity section removed from UI
+# @callback(
+#     [Output('cosine-similarity-graph', 'figure'),
+#      Output('cosine-similarity-section', 'style')],
+#     [Input('cosine-similarity-data', 'data'),
+#      Input('cluster-centroids', 'data')]
+# )
+# def create_cosine_similarity_graph(similarities, centroids):
+#     """Create cosine similarity graph."""
+#     if not similarities or not centroids:
+#         return dash.no_update, {'display': 'none'}
+#     
+#     # Extract frame numbers and similarity scores
+#     frame_numbers = []
+#     times = []
+#     similarity_data = {cluster_id: [] for cluster_id in centroids.keys()}
+#     
+#     for frame_idx, data in similarities.items():
+#         frame_numbers.append(data['frame_number'])
+#         times.append(data['time'])
+#         
+#         for cluster_id, score in data['similarities'].items():
+#             similarity_data[cluster_id].append(score)
+#     
+#     # Define minimal color palette for clusters (ChatGPT style)
+#     cluster_colors = [
+#         '#10a37f', '#8e8ea0', '#202123', '#565869', '#a5a5b1',
+#         '#353740', '#6b7280', '#9ca3af', '#d1d5db', '#e5e7eb'
+#     ]
+#     
+#     # Create figure
+#     fig = go.Figure()
+#     
+#     # Add similarity traces with minimal styling
+#     for i, (cluster_id, scores) in enumerate(similarity_data.items()):
+#         color = cluster_colors[int(cluster_id) % len(cluster_colors)]
+#         
+#         fig.add_trace(go.Scatter(
+#             x=frame_numbers,
+#             y=scores,
+#             mode='lines',
+#             name=f'Cluster {cluster_id}',
+#             line=dict(color=color, width=2),
+#             opacity=0.7,
+#             hoverinfo='y+x',
+#             hovertemplate=f'<b>Cluster {cluster_id}</b><br>Frame: %{{x}}<br>Similarity: %{{y:.3f}}<extra></extra>'
+#         ))
+#     
+#     # Update layout with ChatGPT-esque minimal styling
+#     fig.update_layout(
+#         showlegend=True,
+#         xaxis=dict(
+#             title='Frame Number',
+#             titlefont=dict(size=13, color='#8e8ea0'),
+#             tickfont=dict(size=12, color='#8e8ea0'),
+#             gridcolor='#f0f0f0',
+#             zeroline=False,
+#             showline=False
+#         ),
+#         yaxis=dict(
+#             title='Cosine Similarity',
+#             titlefont=dict(size=13, color='#8e8ea0'),
+#             tickfont=dict(size=12, color='#8e8ea0'),
+#             gridcolor='#f0f0f0',
+#             zeroline=False,
+#             showline=False
+#         ),
+#         margin=dict(l=50, r=30, t=50, b=40),
+#         hovermode='closest',
+#         plot_bgcolor='#ffffff',
+#         paper_bgcolor='#ffffff',
+#         font=dict(family='-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif', size=12),
+#         legend=dict(
+#             orientation="h",
+#             yanchor="bottom",
+#             y=1.02,
+#             xanchor="right",
+#             x=1,
+#             font=dict(size=11),
+#             bgcolor='rgba(255,255,255,0.8)'
+#         )
+#     )
+#     
+#     return fig, {'display': 'block'}
 
-# Callback to display motif visualizations
-@callback(
-    [Output('motif-images-container', 'children'),
-     Output('motif-section', 'style')],
-    Input('motif-visualization-data', 'data')
-)
-def display_motif_visualizations(motif_data):
+# Callback disabled - motif section removed from UI
+# @callback(
+#     [Output('motif-images-container', 'children'),
+#      Output('motif-section', 'style')],
+#     Input('motif-visualization-data', 'data')
+# )
+# def display_motif_visualizations(motif_data):
     """Display the motif visualization images."""
     if not motif_data:
         return html.Div(), {'display': 'none'}
@@ -1238,16 +1424,16 @@ def display_motif_visualizations(motif_data):
     
     return content, {'display': 'block'}
 
-# Callback to visualize FLUSS segmentation results
-@callback(
-    [Output('fluss-segmentation-graph', 'figure'),
-     Output('fluss-segmentation-info', 'children'),
-     Output('fluss-segmentation-section', 'style')],
-    [Input('fluss-segmentation-data', 'data'),
-     Input('cosine-similarity-data', 'data'),
-     Input('cluster-centroids', 'data')]
-)
-def visualize_fluss_segmentation(fluss_data, similarities, centroids):
+# Callback disabled - FLUSS section removed from UI
+# @callback(
+#     [Output('fluss-segmentation-graph', 'figure'),
+#      Output('fluss-segmentation-info', 'children'),
+#      Output('fluss-segmentation-section', 'style')],
+#     [Input('fluss-segmentation-data', 'data'),
+#      Input('cosine-similarity-data', 'data'),
+#      Input('cluster-centroids', 'data')]
+# )
+# def visualize_fluss_segmentation(fluss_data, similarities, centroids):
     """Create visualization of FLUSS segmentation results with GLOBAL segments across all clusters."""
     if not fluss_data or not similarities or not centroids:
         return dash.no_update, "", {'display': 'none'}

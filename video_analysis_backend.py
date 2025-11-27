@@ -922,6 +922,126 @@ class VideoAnalysisBackend:
         logger.info(f"Applied moving average smoothing with window size {window_size} to {len(sorted_frames)} frames")
         return smoothed_similarities
     
+    def plot_cosine_similarities_by_cluster(self, similarities, cluster_assignments=None,
+                                           peak_frames=None, output_dir=None, video_name='video', 
+                                           show_raw=False):
+        """
+        Plots cosine similarity time series for each cluster.
+        
+        Args:
+            similarities: Dictionary mapping frame numbers to similarity scores
+            cluster_assignments: Optional dictionary {peak_idx: cluster_id} for peak frames
+            peak_frames: Optional dictionary {peak_idx: {frame_number, time, ...}} for peak frame info
+            output_dir: Directory to save the plot
+            video_name: Name of the video for the plot title
+            show_raw: Whether to show raw similarities alongside smoothed (if available)
+            
+        Returns:
+            Path to saved plot file
+        """
+        if not similarities:
+            logger.warning("No similarities to plot")
+            return None
+        
+        # Sort frames by frame number
+        sorted_frames = sorted(similarities.keys(), key=lambda x: similarities[x]['frame_number'])
+        
+        # Get cluster IDs
+        first_frame = sorted_frames[0]
+        cluster_ids = sorted(similarities[first_frame]['similarities'].keys())
+        num_clusters = len(cluster_ids)
+        
+        # Extract frame numbers and times
+        frame_numbers = [similarities[f]['frame_number'] for f in sorted_frames]
+        times = [similarities[f]['time'] for f in sorted_frames]
+        
+        # Create figure with subplots for each cluster
+        fig, axes = plt.subplots(num_clusters, 1, figsize=(14, 3 * num_clusters), sharex=True)
+        if num_clusters == 1:
+            axes = [axes]
+        
+        # Color palette for clusters
+        colors = plt.cm.tab10(np.linspace(0, 1, num_clusters))
+        
+        for idx, cluster_id in enumerate(cluster_ids):
+            ax = axes[idx]
+            
+            # Extract similarity values for this cluster
+            sim_values = [similarities[f]['similarities'][cluster_id] for f in sorted_frames]
+            
+            # Plot smoothed similarities
+            ax.plot(times, sim_values, color=colors[idx], linewidth=2, 
+                   label=f'Cluster {cluster_id} (smoothed)' if 'similarities_raw' in similarities[sorted_frames[0]] else f'Cluster {cluster_id}')
+            
+            # Plot raw similarities if available and requested
+            if show_raw and 'similarities_raw' in similarities[sorted_frames[0]]:
+                raw_values = [similarities[f]['similarities_raw'][cluster_id] for f in sorted_frames]
+                ax.plot(times, raw_values, color=colors[idx], alpha=0.3, linewidth=1, 
+                       linestyle='--', label=f'Cluster {cluster_id} (raw)')
+            
+            # Highlight peak frames if cluster assignments provided
+            if cluster_assignments and peak_frames:
+                peak_times = []
+                # cluster_assignments is {peak_idx: cluster_id} where both are ints/strings
+                for peak_idx, assigned_cluster_id in cluster_assignments.items():
+                    # Convert to string for comparison
+                    if str(assigned_cluster_id) == str(cluster_id):
+                        # Get frame info from peak_frames
+                        if peak_idx in peak_frames:
+                            peak_frame_info = peak_frames[peak_idx]
+                            if 'time' in peak_frame_info:
+                                peak_times.append(peak_frame_info['time'])
+                
+                if peak_times:
+                    # Add vertical lines at peak frames
+                    for pt in peak_times:
+                        ax.axvline(x=pt, color=colors[idx], alpha=0.3, linestyle=':', linewidth=1)
+                    
+                    # Add scatter points at peaks
+                    peak_sims = []
+                    for pt in peak_times:
+                        # Find similarity value at this time
+                        for i, t in enumerate(times):
+                            if abs(t - pt) < 0.01:  # Close enough
+                                peak_sims.append(sim_values[i])
+                                break
+                    
+                    if peak_sims:
+                        ax.scatter(peak_times, peak_sims, color=colors[idx], s=100, 
+                                 zorder=5, edgecolors='black', linewidths=1.5,
+                                 label=f'{len(peak_times)} peaks')
+            
+            # Formatting
+            ax.set_ylabel('Cosine Similarity', fontsize=10, fontweight='bold')
+            ax.set_title(f'Cluster {cluster_id} Similarity Over Time', fontsize=11, fontweight='bold')
+            ax.grid(True, alpha=0.3)
+            ax.set_ylim(-0.05, 1.05)
+            ax.legend(loc='upper right', fontsize=9)
+            
+            # Add horizontal line at 0.5 for reference
+            ax.axhline(y=0.5, color='gray', linestyle='--', alpha=0.5, linewidth=1)
+        
+        # Set x-label on bottom plot
+        axes[-1].set_xlabel('Time (seconds)', fontsize=11, fontweight='bold')
+        
+        # Overall title
+        fig.suptitle(f'Cosine Similarity Time Series by Cluster - {video_name}', 
+                    fontsize=14, fontweight='bold', y=0.995)
+        
+        plt.tight_layout()
+        
+        # Save plot
+        if output_dir:
+            os.makedirs(output_dir, exist_ok=True)
+            output_path = os.path.join(output_dir, f'{video_name}_cosine_similarities_by_cluster.png')
+            plt.savefig(output_path, dpi=150, bbox_inches='tight')
+            logger.info(f"Saved cosine similarity plot to: {output_path}")
+            plt.close()
+            return output_path
+        else:
+            plt.show()
+            return None
+    
     def detect_fluss_change_points(self, time_series, window_size=10, num_regimes=None, exclusion_zone=None):
         """
         Detects change points in a univariate time series using STUMPY's FLUSS algorithm.
@@ -1367,6 +1487,2406 @@ class VideoAnalysisBackend:
         
         return results
     
+    def segment_by_peaks(self, similarities, peak_frames):
+        """
+        Segments the cosine similarity time series by eventfulness peaks.
+        Creates segments from peak to peak.
+        
+        Args:
+            similarities: Dictionary mapping frame indices to similarity scores
+            peak_frames: Dictionary of peak frames from eventfulness detection
+            
+        Returns:
+            List of segment dictionaries with similarity statistics
+        """
+        if not similarities or not peak_frames:
+            logger.warning("Missing similarities or peak_frames for peak-based segmentation")
+            return None
+        
+        logger.info(f"Segmenting time series by {len(peak_frames)} peaks")
+        
+        # Sort peaks by time
+        sorted_peaks = sorted(peak_frames.items(), key=lambda x: x[1]['time'])
+        
+        if len(sorted_peaks) < 2:
+            logger.warning("Need at least 2 peaks for segmentation")
+            return None
+        
+        # Get cluster IDs from first similarity entry
+        first_sim_key = list(similarities.keys())[0]
+        cluster_ids = sorted(list(similarities[first_sim_key]['similarities'].keys()))
+        
+        segments = []
+        
+        # Create segments from peak to peak
+        for i in range(len(sorted_peaks) - 1):
+            peak_idx_start, peak_info_start = sorted_peaks[i]
+            peak_idx_end, peak_info_end = sorted_peaks[i + 1]
+            
+            start_frame = peak_info_start['frame_number']
+            end_frame = peak_info_end['frame_number']
+            start_time = peak_info_start['time']
+            end_time = peak_info_end['time']
+            
+            # Extract similarity vectors for frames in this segment
+            segment_similarities = []
+            segment_frames = []
+            segment_times = []
+            
+            for frame_key, sim_data in similarities.items():
+                frame_num = sim_data['frame_number']
+                if start_frame <= frame_num < end_frame:
+                    # Get similarity vector for all clusters
+                    sim_vector = [sim_data['similarities'].get(cid, 0.0) for cid in cluster_ids]
+                    segment_similarities.append(sim_vector)
+                    segment_frames.append(frame_num)
+                    segment_times.append(sim_data['time'])
+            
+            # Calculate statistics for this segment
+            if segment_similarities:
+                sim_array = np.array(segment_similarities)
+                mean_similarity = np.mean(sim_array, axis=0)
+                std_similarity = np.std(sim_array, axis=0)
+                
+                segment = {
+                    'segment_id': i,
+                    'start_peak_idx': peak_idx_start,
+                    'end_peak_idx': peak_idx_end,
+                    'start_frame': int(start_frame),
+                    'end_frame': int(end_frame),
+                    'start_time': float(start_time),
+                    'end_time': float(end_time),
+                    'duration': float(end_time - start_time),
+                    'num_frames': len(segment_frames),
+                    'frame_numbers': segment_frames,
+                    'times': segment_times,
+                    'mean_similarity': mean_similarity.tolist(),
+                    'std_similarity': std_similarity.tolist(),
+                    'similarity_vectors': [s.tolist() for s in segment_similarities]
+                }
+                
+                segments.append(segment)
+        
+        logger.info(f"Created {len(segments)} segments from peaks")
+        return segments
+    
+    def compare_segments_similarity(self, segment1, segment2, method='mean_cosine'):
+        """
+        Compares two segments based on their similarity patterns.
+        
+        Args:
+            segment1: First segment dictionary
+            segment2: Second segment dictionary
+            method: Comparison method ('mean_cosine', 'dtw', 'correlation')
+            
+        Returns:
+            Similarity score (0-1, higher = more similar)
+        """
+        if method == 'mean_cosine':
+            # Compare mean similarity vectors using cosine similarity
+            mean1 = np.array(segment1['mean_similarity'])
+            mean2 = np.array(segment2['mean_similarity'])
+            
+            # Cosine similarity
+            similarity = cosine_similarity([mean1], [mean2])[0][0]
+            return float(similarity)
+        
+        elif method == 'dtw':
+            # Compare full similarity time series using DTW
+            try:
+                from scipy.spatial.distance import euclidean
+                from fastdtw import fastdtw
+                
+                seq1 = np.array(segment1['similarity_vectors'])
+                seq2 = np.array(segment2['similarity_vectors'])
+                
+                distance, path = fastdtw(seq1, seq2, dist=euclidean)
+                normalized_distance = distance / (len(seq1) + len(seq2))
+                similarity = np.exp(-normalized_distance)
+                
+                return float(similarity)
+            except ImportError:
+                logger.warning("fastdtw not available, falling back to mean_cosine")
+                return self.compare_segments_similarity(segment1, segment2, method='mean_cosine')
+        
+        elif method == 'correlation':
+            # Compare using correlation of mean similarity patterns
+            mean1 = np.array(segment1['mean_similarity'])
+            mean2 = np.array(segment2['mean_similarity'])
+            
+            correlation = np.corrcoef(mean1, mean2)[0, 1]
+            # Convert correlation to 0-1 range
+            similarity = (correlation + 1) / 2
+            
+            return float(similarity)
+        
+        else:
+            logger.warning(f"Unknown comparison method: {method}, using mean_cosine")
+            return self.compare_segments_similarity(segment1, segment2, method='mean_cosine')
+    
+    def merge_similar_segments(self, segments, similarity_threshold=0.8, max_passes=10, comparison_method='mean_cosine'):
+        """
+        Iteratively merges similar adjacent segments.
+        
+        Args:
+            segments: List of segment dictionaries
+            similarity_threshold: Threshold for merging (0-1)
+            max_passes: Maximum number of merge passes
+            comparison_method: Method for comparing segments
+            
+        Returns:
+            Dictionary with merged segments and merge history
+        """
+        if not segments:
+            return None
+        
+        logger.info(f"Starting segment merging with threshold={similarity_threshold}, max_passes={max_passes}")
+        
+        current_segments = [seg.copy() for seg in segments]
+        merge_history = []
+        pass_num = 0
+        
+        while pass_num < max_passes:
+            merged_this_pass = False
+            new_segments = []
+            skip_next = False
+            
+            for i in range(len(current_segments)):
+                if skip_next:
+                    skip_next = False
+                    continue
+                
+                # Check if we can merge with next segment
+                if i < len(current_segments) - 1:
+                    seg1 = current_segments[i]
+                    seg2 = current_segments[i + 1]
+                    
+                    # Compare segments
+                    similarity = self.compare_segments_similarity(seg1, seg2, method=comparison_method)
+                    
+                    if similarity >= similarity_threshold:
+                        # Merge segments
+                        merged_segment = self._merge_similarity_segments(seg1, seg2)
+                        new_segments.append(merged_segment)
+                        
+                        merge_history.append({
+                            'pass': pass_num,
+                            'merged_segments': [seg1['segment_id'], seg2['segment_id']],
+                            'similarity': float(similarity),
+                            'new_segment_id': merged_segment['segment_id']
+                        })
+                        
+                        merged_this_pass = True
+                        skip_next = True
+                    else:
+                        new_segments.append(seg1)
+                else:
+                    new_segments.append(current_segments[i])
+            
+            # Renumber segments
+            for i, seg in enumerate(new_segments):
+                seg['segment_id'] = i
+            
+            current_segments = new_segments
+            pass_num += 1
+            
+            logger.info(f"Pass {pass_num}: {len(current_segments)} segments (merged: {merged_this_pass})")
+            
+            if not merged_this_pass:
+                break
+        
+        logger.info(f"Merging completed after {pass_num} passes: {len(segments)} → {len(current_segments)} segments")
+        
+        return {
+            'segments': current_segments,
+            'merge_history': merge_history,
+            'num_passes': pass_num,
+            'initial_count': len(segments),
+            'final_count': len(current_segments),
+            'similarity_threshold': similarity_threshold,
+            'comparison_method': comparison_method
+        }
+    
+    def _merge_similarity_segments(self, seg1, seg2):
+        """Helper function to merge two similarity-based segments."""
+        # Combine similarity vectors
+        combined_vectors = seg1['similarity_vectors'] + seg2['similarity_vectors']
+        combined_frames = seg1['frame_numbers'] + seg2['frame_numbers']
+        combined_times = seg1['times'] + seg2['times']
+        
+        # Recalculate statistics
+        if combined_vectors:
+            sim_array = np.array(combined_vectors)
+            mean_similarity = np.mean(sim_array, axis=0)
+            std_similarity = np.std(sim_array, axis=0)
+        else:
+            mean_similarity = None
+            std_similarity = None
+        
+        merged = {
+            'segment_id': seg1['segment_id'],
+            'start_peak_idx': seg1['start_peak_idx'],
+            'end_peak_idx': seg2['end_peak_idx'],
+            'start_frame': seg1['start_frame'],
+            'end_frame': seg2['end_frame'],
+            'start_time': seg1['start_time'],
+            'end_time': seg2['end_time'],
+            'duration': seg2['end_time'] - seg1['start_time'],
+            'num_frames': len(combined_frames),
+            'frame_numbers': combined_frames,
+            'times': combined_times,
+            'mean_similarity': mean_similarity.tolist() if mean_similarity is not None else None,
+            'std_similarity': std_similarity.tolist() if std_similarity is not None else None,
+            'similarity_vectors': combined_vectors,
+            'merged_from': [seg1['segment_id'], seg2['segment_id']]
+        }
+        
+        return merged
+    
+    def segment_by_eventfulness_peaks(self, peak_frames, pose_data):
+        """
+        Segments video data from peak to peak based on eventfulness data.
+        Extracts pose estimation data for each segment.
+        
+        Args:
+            peak_frames: Dictionary mapping peak indices to frame info (from eventfulness detection)
+            pose_data: Dictionary of frame-by-frame pose estimation data
+            
+        Returns:
+            List of segment dictionaries, each containing:
+            {
+                'segment_id': int,
+                'start_peak_idx': int,
+                'end_peak_idx': int,
+                'start_frame': int,
+                'end_frame': int,
+                'start_time': float,
+                'end_time': float,
+                'duration': float,
+                'num_frames': int,
+                'pose_vectors': list of pose vectors for all frames in segment,
+                'frame_numbers': list of frame numbers in segment,
+                'times': list of timestamps in segment,
+                'mean_pose': average pose vector for segment,
+                'std_pose': standard deviation of pose vectors
+            }
+        """
+        if not peak_frames or not pose_data:
+            logger.warning("No peak frames or pose data provided for segmentation")
+            return []
+        
+        # Sort peaks by frame number
+        sorted_peaks = sorted(peak_frames.items(), key=lambda x: x[1]['frame_number'])
+        
+        if len(sorted_peaks) < 2:
+            logger.warning("Need at least 2 peaks for peak-to-peak segmentation")
+            return []
+        
+        logger.info(f"Creating segments from {len(sorted_peaks)} peaks")
+        
+        segments = []
+        
+        # Create segments from peak to peak
+        for i in range(len(sorted_peaks) - 1):
+            peak_idx_start, peak_info_start = sorted_peaks[i]
+            peak_idx_end, peak_info_end = sorted_peaks[i + 1]
+            
+            start_frame = peak_info_start['frame_number']
+            end_frame = peak_info_end['frame_number']
+            start_time = peak_info_start['time']
+            end_time = peak_info_end['time']
+            
+            # Extract pose data for frames in this segment
+            segment_pose_vectors = []
+            segment_frame_numbers = []
+            segment_times = []
+            
+            for frame_key, frame_data in pose_data.items():
+                frame_num = frame_data['frame_number']
+                if start_frame <= frame_num < end_frame:
+                    pose_vector = frame_data.get('pose_vector', None)
+                    if pose_vector is not None:
+                        segment_pose_vectors.append(pose_vector)
+                        segment_frame_numbers.append(frame_num)
+                        segment_times.append(frame_data['time'])
+            
+            # Calculate statistics for the segment
+            if segment_pose_vectors:
+                pose_array = np.array(segment_pose_vectors)
+                mean_pose = np.mean(pose_array, axis=0).tolist()
+                std_pose = np.std(pose_array, axis=0).tolist()
+            else:
+                mean_pose = None
+                std_pose = None
+            
+            segment = {
+                'segment_id': i,
+                'start_peak_idx': peak_idx_start,
+                'end_peak_idx': peak_idx_end,
+                'start_frame': int(start_frame),
+                'end_frame': int(end_frame),
+                'start_time': float(start_time),
+                'end_time': float(end_time),
+                'duration': float(end_time - start_time),
+                'num_frames': len(segment_pose_vectors),
+                'pose_vectors': segment_pose_vectors,
+                'frame_numbers': segment_frame_numbers,
+                'times': segment_times,
+                'mean_pose': mean_pose,
+                'std_pose': std_pose
+            }
+            
+            segments.append(segment)
+        
+        logger.info(f"Created {len(segments)} segments from peak-to-peak")
+        return segments
+    
+    def compare_pose_segments(self, segment1, segment2, method='cosine', **kwargs):
+        """
+        Compares two pose segments using various comparison methods.
+        
+        Args:
+            segment1: First segment dictionary (from segment_by_eventfulness_peaks)
+            segment2: Second segment dictionary
+            method: Comparison method - 'cosine', 'dtw', 'statistical', 'frechet', or 'all'
+            **kwargs: Additional parameters for specific methods
+            
+        Returns:
+            Dictionary containing similarity scores and comparison details:
+            {
+                'method': str,
+                'similarity': float (0-1, higher = more similar),
+                'distance': float (method-specific distance metric),
+                'details': dict (method-specific details)
+            }
+        """
+        if not segment1 or not segment2:
+            return None
+        
+        if segment1.get('mean_pose') is None or segment2.get('mean_pose') is None:
+            logger.warning("Segments missing mean_pose, cannot compare")
+            return None
+        
+        results = {}
+        
+        if method == 'cosine' or method == 'all':
+            # Method A: Cosine Similarity (fast, good for normalized data)
+            mean1 = np.array(segment1['mean_pose'])
+            mean2 = np.array(segment2['mean_pose'])
+            
+            # Calculate cosine similarity
+            cos_sim = cosine_similarity([mean1], [mean2])[0][0]
+            
+            results['cosine'] = {
+                'method': 'cosine',
+                'similarity': float(cos_sim),
+                'distance': float(1 - cos_sim),
+                'details': {
+                    'description': 'Cosine similarity between mean pose vectors'
+                }
+            }
+        
+        if method == 'dtw' or method == 'all':
+            # Method B: Dynamic Time Warping (accounts for temporal alignment)
+            try:
+                from scipy.spatial.distance import euclidean
+                from fastdtw import fastdtw
+                
+                seq1 = np.array(segment1['pose_vectors'])
+                seq2 = np.array(segment2['pose_vectors'])
+                
+                # Use fastdtw for efficiency
+                distance, path = fastdtw(seq1, seq2, dist=euclidean)
+                
+                # Normalize by sequence length
+                normalized_distance = distance / (len(seq1) + len(seq2))
+                
+                # Convert to similarity (0-1 scale, using exponential decay)
+                similarity = np.exp(-normalized_distance)
+                
+                results['dtw'] = {
+                    'method': 'dtw',
+                    'similarity': float(similarity),
+                    'distance': float(distance),
+                    'details': {
+                        'normalized_distance': float(normalized_distance),
+                        'path_length': len(path),
+                        'description': 'Dynamic Time Warping distance'
+                    }
+                }
+            except ImportError:
+                logger.warning("fastdtw not available, skipping DTW comparison")
+            except Exception as e:
+                logger.error(f"Error in DTW comparison: {str(e)}")
+        
+        if method == 'statistical' or method == 'all':
+            # Method C: Statistical Comparison (KS test and t-test)
+            from scipy.stats import ks_2samp, ttest_ind
+            
+            seq1 = np.array(segment1['pose_vectors'])
+            seq2 = np.array(segment2['pose_vectors'])
+            
+            # Perform tests for each pose dimension
+            ks_pvalues = []
+            ttest_pvalues = []
+            
+            for dim in range(seq1.shape[1]):
+                # Kolmogorov-Smirnov test
+                ks_stat, ks_pval = ks_2samp(seq1[:, dim], seq2[:, dim])
+                ks_pvalues.append(ks_pval)
+                
+                # t-test
+                t_stat, t_pval = ttest_ind(seq1[:, dim], seq2[:, dim])
+                ttest_pvalues.append(t_pval)
+            
+            # Average p-values across dimensions (higher p-value = more similar)
+            avg_ks_pval = np.mean(ks_pvalues)
+            avg_ttest_pval = np.mean(ttest_pvalues)
+            
+            # Use average p-value as similarity (0-1 scale)
+            similarity = (avg_ks_pval + avg_ttest_pval) / 2
+            
+            results['statistical'] = {
+                'method': 'statistical',
+                'similarity': float(similarity),
+                'distance': float(1 - similarity),
+                'details': {
+                    'ks_pvalue': float(avg_ks_pval),
+                    'ttest_pvalue': float(avg_ttest_pval),
+                    'num_dimensions': seq1.shape[1],
+                    'description': 'Statistical tests (KS and t-test) across pose dimensions'
+                }
+            }
+        
+        if method == 'frechet' or method == 'all':
+            # Method D: Frechet Distance (trajectory similarity)
+            try:
+                from scipy.spatial.distance import directed_hausdorff
+                
+                seq1 = np.array(segment1['pose_vectors'])
+                seq2 = np.array(segment2['pose_vectors'])
+                
+                # Use Hausdorff distance as approximation of Frechet distance
+                dist_forward = directed_hausdorff(seq1, seq2)[0]
+                dist_backward = directed_hausdorff(seq2, seq1)[0]
+                distance = max(dist_forward, dist_backward)
+                
+                # Convert to similarity (0-1 scale)
+                similarity = np.exp(-distance)
+                
+                results['frechet'] = {
+                    'method': 'frechet',
+                    'similarity': float(similarity),
+                    'distance': float(distance),
+                    'details': {
+                        'hausdorff_forward': float(dist_forward),
+                        'hausdorff_backward': float(dist_backward),
+                        'description': 'Hausdorff distance (approximation of Frechet)'
+                    }
+                }
+            except Exception as e:
+                logger.error(f"Error in Frechet distance comparison: {str(e)}")
+        
+        # Return single method result or all results
+        if method == 'all':
+            return results
+        else:
+            return results.get(method, None)
+    
+    def calculate_adaptive_threshold(self, similarity_matrix, method='otsu'):
+        """
+        Calculates an adaptive threshold for segment similarity decisions.
+        
+        Args:
+            similarity_matrix: 2D numpy array of pairwise similarities
+            method: Thresholding method - 'otsu', 'percentile', 'kmeans', or 'statistical'
+            
+        Returns:
+            float: Optimal threshold value
+        """
+        if similarity_matrix is None or similarity_matrix.size == 0:
+            return 0.5  # Default threshold
+        
+        # Flatten and remove diagonal (self-similarities)
+        n = similarity_matrix.shape[0]
+        mask = ~np.eye(n, dtype=bool)
+        similarities = similarity_matrix[mask].flatten()
+        
+        if len(similarities) == 0:
+            return 0.5
+        
+        if method == 'otsu':
+            # Otsu's method for optimal threshold
+            # Discretize similarities into bins
+            hist, bin_edges = np.histogram(similarities, bins=100)
+            bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
+            
+            # Calculate weights and means
+            weight1 = np.cumsum(hist)
+            weight2 = np.cumsum(hist[::-1])[::-1]
+            
+            mean1 = np.cumsum(hist * bin_centers) / weight1
+            mean2 = (np.cumsum((hist * bin_centers)[::-1]) / weight2)[::-1]
+            
+            # Calculate between-class variance
+            variance = weight1[:-1] * weight2[1:] * (mean1[:-1] - mean2[1:]) ** 2
+            
+            # Find threshold that maximizes variance
+            idx = np.argmax(variance)
+            threshold = bin_centers[idx]
+            
+            logger.info(f"Otsu threshold: {threshold:.4f}")
+            return float(threshold)
+        
+        elif method == 'percentile':
+            # Use median or specific percentile
+            threshold = np.percentile(similarities, 50)  # Median
+            logger.info(f"Percentile threshold (50th): {threshold:.4f}")
+            return float(threshold)
+        
+        elif method == 'kmeans':
+            # Use K-means to separate into similar/dissimilar groups
+            from sklearn.cluster import KMeans
+            
+            similarities_reshaped = similarities.reshape(-1, 1)
+            kmeans = KMeans(n_clusters=2, random_state=42)
+            kmeans.fit(similarities_reshaped)
+            
+            # Threshold is midpoint between cluster centers
+            centers = sorted(kmeans.cluster_centers_.flatten())
+            threshold = (centers[0] + centers[1]) / 2
+            
+            logger.info(f"K-means threshold: {threshold:.4f}")
+            return float(threshold)
+        
+        elif method == 'statistical':
+            # Use mean + std as threshold
+            mean_sim = np.mean(similarities)
+            std_sim = np.std(similarities)
+            threshold = mean_sim + 0.5 * std_sim
+            
+            logger.info(f"Statistical threshold (mean + 0.5*std): {threshold:.4f}")
+            return float(threshold)
+        
+        else:
+            logger.warning(f"Unknown threshold method: {method}, using median")
+            return float(np.median(similarities))
+    
+    def compute_segment_similarity_matrix(self, segments, comparison_method='cosine'):
+        """
+        Computes pairwise similarity matrix for all segments.
+        
+        Args:
+            segments: List of segment dictionaries
+            comparison_method: Method to use for comparison ('cosine', 'dtw', 'statistical', 'frechet')
+            
+        Returns:
+            Tuple of (similarity_matrix, distance_matrix, comparison_details)
+        """
+        if not segments:
+            return None, None, None
+        
+        n = len(segments)
+        similarity_matrix = np.zeros((n, n))
+        distance_matrix = np.zeros((n, n))
+        comparison_details = {}
+        
+        logger.info(f"Computing {n}x{n} similarity matrix using {comparison_method} method")
+        
+        # Compute pairwise comparisons
+        for i in range(n):
+            for j in range(i, n):
+                if i == j:
+                    # Self-similarity is 1
+                    similarity_matrix[i, j] = 1.0
+                    distance_matrix[i, j] = 0.0
+                else:
+                    # Compare segments
+                    result = self.compare_pose_segments(
+                        segments[i], segments[j], method=comparison_method)
+                    
+                    if result:
+                        similarity = result.get('similarity', 0.0)
+                        distance = result.get('distance', 1.0)
+                        
+                        # Fill symmetric matrix
+                        similarity_matrix[i, j] = similarity
+                        similarity_matrix[j, i] = similarity
+                        distance_matrix[i, j] = distance
+                        distance_matrix[j, i] = distance
+                        
+                        # Store details for first few comparisons
+                        if len(comparison_details) < 10:
+                            comparison_details[f"seg{i}_vs_seg{j}"] = result
+        
+        logger.info(f"Computed similarity matrix: mean={np.mean(similarity_matrix):.3f}, "
+                   f"std={np.std(similarity_matrix):.3f}")
+        
+        return similarity_matrix, distance_matrix, comparison_details
+    
+    def recursive_segment_refinement(self, segments, similarity_matrix, threshold=0.7, 
+                                     strategy='merge_similar', max_iterations=10):
+        """
+        Recursively refines segments by merging similar or splitting different segments.
+        
+        Args:
+            segments: List of initial segment dictionaries
+            similarity_matrix: Pairwise similarity matrix
+            threshold: Similarity threshold for decisions
+            strategy: 'merge_similar' or 'split_different'
+            max_iterations: Maximum number of refinement iterations
+            
+        Returns:
+            Dictionary containing:
+            {
+                'final_segments': list of refined segments,
+                'merge_history': list of merge operations,
+                'iteration_count': number of iterations performed,
+                'strategy': strategy used
+            }
+        """
+        if not segments or similarity_matrix is None:
+            return None
+        
+        logger.info(f"Starting recursive refinement with strategy: {strategy}, threshold: {threshold}")
+        
+        current_segments = [seg.copy() for seg in segments]
+        merge_history = []
+        iteration = 0
+        
+        if strategy == 'merge_similar':
+            # Iteratively merge adjacent segments if they are similar
+            while iteration < max_iterations:
+                merged = False
+                new_segments = []
+                skip_next = False
+                
+                for i in range(len(current_segments)):
+                    if skip_next:
+                        skip_next = False
+                        continue
+                    
+                    # Check if we can merge with next segment
+                    if i < len(current_segments) - 1:
+                        # Find similarity between adjacent segments
+                        seg_i_id = current_segments[i].get('original_id', i)
+                        seg_j_id = current_segments[i + 1].get('original_id', i + 1)
+                        
+                        # For merged segments, use stored similarity or recompute
+                        if seg_i_id < len(segments) and seg_j_id < len(segments):
+                            sim = similarity_matrix[seg_i_id, seg_j_id]
+                        else:
+                            # Recompute for merged segments
+                            result = self.compare_pose_segments(
+                                current_segments[i], current_segments[i + 1], method='cosine')
+                            sim = result['similarity'] if result else 0.0
+                        
+                        if sim >= threshold:
+                            # Merge segments
+                            merged_segment = self._merge_two_segments(
+                                current_segments[i], current_segments[i + 1])
+                            new_segments.append(merged_segment)
+                            
+                            merge_history.append({
+                                'iteration': iteration,
+                                'action': 'merge',
+                                'segments': [i, i + 1],
+                                'similarity': float(sim),
+                                'reason': f'similarity {sim:.3f} >= threshold {threshold:.3f}'
+                            })
+                            
+                            merged = True
+                            skip_next = True
+                        else:
+                            new_segments.append(current_segments[i])
+                    else:
+                        new_segments.append(current_segments[i])
+                
+                current_segments = new_segments
+                iteration += 1
+                
+                logger.info(f"Iteration {iteration}: {len(current_segments)} segments after merging")
+                
+                if not merged:
+                    break
+        
+        # Renumber segments
+        for i, seg in enumerate(current_segments):
+            seg['segment_id'] = i
+        
+        logger.info(f"Refinement completed after {iteration} iterations: "
+                   f"{len(segments)} -> {len(current_segments)} segments")
+        
+        return {
+            'final_segments': current_segments,
+            'merge_history': merge_history,
+            'iteration_count': iteration,
+            'strategy': strategy,
+            'initial_count': len(segments),
+            'final_count': len(current_segments)
+        }
+    
+    def _merge_two_segments(self, seg1, seg2):
+        """Helper function to merge two segments."""
+        # Combine pose vectors
+        combined_poses = seg1['pose_vectors'] + seg2['pose_vectors']
+        combined_frames = seg1['frame_numbers'] + seg2['frame_numbers']
+        combined_times = seg1['times'] + seg2['times']
+        
+        # Recalculate statistics
+        if combined_poses:
+            pose_array = np.array(combined_poses)
+            mean_pose = np.mean(pose_array, axis=0).tolist()
+            std_pose = np.std(pose_array, axis=0).tolist()
+        else:
+            mean_pose = None
+            std_pose = None
+        
+        merged = {
+            'segment_id': seg1['segment_id'],
+            'original_id': seg1.get('original_id', seg1['segment_id']),
+            'start_peak_idx': seg1['start_peak_idx'],
+            'end_peak_idx': seg2['end_peak_idx'],
+            'start_frame': seg1['start_frame'],
+            'end_frame': seg2['end_frame'],
+            'start_time': seg1['start_time'],
+            'end_time': seg2['end_time'],
+            'duration': seg2['end_time'] - seg1['start_time'],
+            'num_frames': len(combined_poses),
+            'pose_vectors': combined_poses,
+            'frame_numbers': combined_frames,
+            'times': combined_times,
+            'mean_pose': mean_pose,
+            'std_pose': std_pose,
+            'merged_from': [seg1['segment_id'], seg2['segment_id']]
+        }
+        
+        return merged
+    
+    def get_segments_with_boundaries(self, segments):
+        """
+        Returns simple segment list with boundaries and scores.
+        
+        Args:
+            segments: List of segment dictionaries
+            
+        Returns:
+            List of simplified segment info
+        """
+        output = []
+        for seg in segments:
+            output.append({
+                'segment_id': seg['segment_id'],
+                'start_frame': seg['start_frame'],
+                'end_frame': seg['end_frame'],
+                'start_time': seg['start_time'],
+                'end_time': seg['end_time'],
+                'duration': seg['duration'],
+                'num_frames': seg['num_frames']
+            })
+        return output
+    
+    def get_segments_with_labels(self, segments, similarity_matrix, num_clusters=None):
+        """
+        Clusters segments and assigns labels based on pose similarity.
+        
+        Args:
+            segments: List of segment dictionaries
+            similarity_matrix: Pairwise similarity matrix
+            num_clusters: Number of clusters (if None, auto-determine)
+            
+        Returns:
+            List of segments with cluster labels
+        """
+        if not segments or similarity_matrix is None:
+            return []
+        
+        # Convert similarity to distance for clustering
+        distance_matrix = 1 - similarity_matrix
+        
+        # Determine optimal number of clusters if not specified
+        if num_clusters is None:
+            # Use silhouette score to find optimal k
+            from sklearn.metrics import silhouette_score
+            from sklearn.cluster import AgglomerativeClustering
+            
+            best_k = 2
+            best_score = -1
+            
+            for k in range(2, min(len(segments), 10)):
+                clustering = AgglomerativeClustering(
+                    n_clusters=k, metric='precomputed', linkage='average')
+                labels = clustering.fit_predict(distance_matrix)
+                
+                if len(np.unique(labels)) > 1:
+                    score = silhouette_score(distance_matrix, labels, metric='precomputed')
+                    if score > best_score:
+                        best_score = score
+                        best_k = k
+            
+            num_clusters = best_k
+            logger.info(f"Auto-determined {num_clusters} clusters for segments")
+        
+        # Perform clustering
+        from sklearn.cluster import AgglomerativeClustering
+        clustering = AgglomerativeClustering(
+            n_clusters=num_clusters, metric='precomputed', linkage='average')
+        labels = clustering.fit_predict(distance_matrix)
+        
+        # Add labels to segments
+        output = []
+        for i, seg in enumerate(segments):
+            seg_with_label = seg.copy()
+            seg_with_label['cluster_label'] = int(labels[i])
+            seg_with_label['cluster_name'] = f"Pose_Type_{labels[i]}"
+            output.append(seg_with_label)
+        
+        logger.info(f"Assigned {num_clusters} cluster labels to {len(segments)} segments")
+        return output
+    
+    
+    def get_change_points(self, segments, pose_data, threshold_percentile=90):
+        """
+        Identifies frames where significant pose changes occur.
+        
+        Args:
+            segments: List of segment dictionaries
+            pose_data: Full pose data dictionary
+            threshold_percentile: Percentile for determining significant changes
+            
+        Returns:
+            List of change point dictionaries
+        """
+        change_points = []
+        
+        # Calculate frame-to-frame pose differences across entire video
+        sorted_frames = sorted(pose_data.items(), 
+                              key=lambda x: pose_data[x[0]]['frame_number'])
+        
+        pose_vectors = []
+        frame_numbers = []
+        times = []
+        
+        for frame_key, frame_data in sorted_frames:
+            pose_vec = frame_data.get('pose_vector')
+            if pose_vec is not None:
+                pose_vectors.append(pose_vec)
+                frame_numbers.append(frame_data['frame_number'])
+                times.append(frame_data['time'])
+        
+        if len(pose_vectors) < 2:
+            return []
+        
+        # Calculate differences
+        pose_array = np.array(pose_vectors)
+        diffs = np.linalg.norm(np.diff(pose_array, axis=0), axis=1)
+        
+        # Find significant changes
+        threshold = np.percentile(diffs, threshold_percentile)
+        significant_indices = np.where(diffs > threshold)[0]
+        
+        # Create change point objects
+        for idx in significant_indices:
+            # Find which segment this belongs to
+            frame_num = frame_numbers[idx]
+            segment_id = None
+            for seg in segments:
+                if seg['start_frame'] <= frame_num < seg['end_frame']:
+                    segment_id = seg['segment_id']
+                    break
+            
+            change_points.append({
+                'frame_number': int(frame_num),
+                'time': float(times[idx]),
+                'pose_change_magnitude': float(diffs[idx]),
+                'segment_id': segment_id,
+                'is_segment_boundary': any(
+                    seg['start_frame'] == frame_num or seg['end_frame'] == frame_num 
+                    for seg in segments
+                )
+            })
+        
+        logger.info(f"Identified {len(change_points)} significant pose change points")
+        return change_points
+    
+    def visualize_segment_creation(self, segment, adjacent_segments, comparison_results, 
+                                   output_dir=None, video_name='video'):
+        """
+        Visualizes how a specific segment was created, showing comparisons with adjacent segments.
+        
+        Args:
+            segment: The segment to visualize
+            adjacent_segments: Dict with 'prev' and 'next' segments (can be None)
+            comparison_results: Dict with comparison results to prev/next segments
+            output_dir: Directory to save visualization
+            video_name: Name of video for file naming
+        """
+        if output_dir is None:
+            output_dir = RESULTS_DIR
+        
+        os.makedirs(output_dir, exist_ok=True)
+        
+        seg_id = segment['segment_id']
+        
+        # Create figure with multiple subplots
+        fig = plt.figure(figsize=(20, 12))
+        gs = fig.add_gridspec(4, 3, hspace=0.3, wspace=0.3)
+        
+        # Plot 1: Pose trajectory for this segment (multiple dimensions)
+        ax1 = fig.add_subplot(gs[0:2, 0])
+        if segment['pose_vectors']:
+            pose_array = np.array(segment['pose_vectors'])
+            # Plot first few dimensions
+            for dim in range(min(5, pose_array.shape[1])):
+                ax1.plot(segment['frame_numbers'], pose_array[:, dim], 
+                        label=f'Dim {dim}', alpha=0.7)
+            ax1.set_xlabel('Frame Number')
+            ax1.set_ylabel('Pose Value')
+            ax1.set_title(f'Segment {seg_id}: Pose Trajectory')
+            ax1.legend(loc='upper right', fontsize=8)
+            ax1.grid(True, alpha=0.3)
+        
+        # Plot 2: Comparison with previous segment
+        ax2 = fig.add_subplot(gs[0, 1])
+        if adjacent_segments.get('prev') and comparison_results.get('prev'):
+            prev_seg = adjacent_segments['prev']
+            prev_result = comparison_results['prev']
+            
+            # Show similarity score
+            sim = prev_result.get('similarity', 0)
+            ax2.text(0.5, 0.6, f"Similarity: {sim:.3f}", 
+                    ha='center', va='center', fontsize=14, weight='bold')
+            ax2.text(0.5, 0.4, f"Method: {prev_result.get('method', 'N/A')}", 
+                    ha='center', va='center', fontsize=10)
+            ax2.text(0.5, 0.2, f"Distance: {prev_result.get('distance', 0):.3f}", 
+                    ha='center', va='center', fontsize=10)
+            
+            # Color code based on similarity
+            color = 'green' if sim > 0.7 else 'orange' if sim > 0.4 else 'red'
+            ax2.set_facecolor((*plt.cm.colors.to_rgb(color), 0.2))
+            
+            ax2.set_title(f'vs Segment {prev_seg["segment_id"]} (Previous)')
+        else:
+            ax2.text(0.5, 0.5, 'No previous segment', ha='center', va='center')
+        ax2.axis('off')
+        
+        # Plot 3: Comparison with next segment
+        ax3 = fig.add_subplot(gs[0, 2])
+        if adjacent_segments.get('next') and comparison_results.get('next'):
+            next_seg = adjacent_segments['next']
+            next_result = comparison_results['next']
+            
+            # Show similarity score
+            sim = next_result.get('similarity', 0)
+            ax3.text(0.5, 0.6, f"Similarity: {sim:.3f}", 
+                    ha='center', va='center', fontsize=14, weight='bold')
+            ax3.text(0.5, 0.4, f"Method: {next_result.get('method', 'N/A')}", 
+                    ha='center', va='center', fontsize=10)
+            ax3.text(0.5, 0.2, f"Distance: {next_result.get('distance', 0):.3f}", 
+                    ha='center', va='center', fontsize=10)
+            
+            # Color code based on similarity
+            color = 'green' if sim > 0.7 else 'orange' if sim > 0.4 else 'red'
+            ax3.set_facecolor((*plt.cm.colors.to_rgb(color), 0.2))
+            
+            ax3.set_title(f'vs Segment {next_seg["segment_id"]} (Next)')
+        else:
+            ax3.text(0.5, 0.5, 'No next segment', ha='center', va='center')
+        ax3.axis('off')
+        
+        # Plot 4: Overlay of mean poses
+        ax4 = fig.add_subplot(gs[1, 1:])
+        if segment.get('mean_pose'):
+            mean_pose = np.array(segment['mean_pose'])
+            x_coords = np.arange(len(mean_pose))
+            
+            ax4.plot(x_coords, mean_pose, 'b-', linewidth=2, label=f'Seg {seg_id}')
+            
+            if adjacent_segments.get('prev') and adjacent_segments['prev'].get('mean_pose'):
+                prev_mean = np.array(adjacent_segments['prev']['mean_pose'])
+                ax4.plot(x_coords, prev_mean, 'r--', alpha=0.6, label='Previous')
+            
+            if adjacent_segments.get('next') and adjacent_segments['next'].get('mean_pose'):
+                next_mean = np.array(adjacent_segments['next']['mean_pose'])
+                ax4.plot(x_coords, next_mean, 'g--', alpha=0.6, label='Next')
+            
+            ax4.set_xlabel('Pose Dimension')
+            ax4.set_ylabel('Mean Value')
+            ax4.set_title('Mean Pose Comparison')
+            ax4.legend()
+            ax4.grid(True, alpha=0.3)
+        
+        # Plot 5: Segment statistics
+        ax5 = fig.add_subplot(gs[2, :])
+        stats_text = f"""
+        Segment ID: {seg_id}
+        Frames: {segment['start_frame']} - {segment['end_frame']} ({segment['num_frames']} frames)
+        Time: {segment['start_time']:.2f}s - {segment['end_time']:.2f}s (Duration: {segment['duration']:.2f}s)
+        Peak Range: {segment.get('start_peak_idx', 'N/A')} - {segment.get('end_peak_idx', 'N/A')}
+        """
+        
+        if segment.get('merged_from'):
+            stats_text += f"\nMerged from segments: {segment['merged_from']}"
+        
+        ax5.text(0.1, 0.5, stats_text, fontsize=10, family='monospace', 
+                va='center', transform=ax5.transAxes)
+        ax5.axis('off')
+        
+        # Plot 6: Pose variance within segment
+        ax6 = fig.add_subplot(gs[3, :])
+        if segment['pose_vectors'] and len(segment['pose_vectors']) > 1:
+            pose_array = np.array(segment['pose_vectors'])
+            variances = np.var(pose_array, axis=0)
+            
+            ax6.bar(range(len(variances)), variances, alpha=0.7)
+            ax6.set_xlabel('Pose Dimension')
+            ax6.set_ylabel('Variance')
+            ax6.set_title('Pose Variance Within Segment (higher = more movement)')
+            ax6.grid(True, alpha=0.3, axis='y')
+        
+        plt.suptitle(f'Segment {seg_id} Creation Analysis - {video_name}', 
+                    fontsize=16, weight='bold')
+        
+        # Save figure
+        output_path = os.path.join(output_dir, f'segment_{seg_id}_creation_{video_name}.png')
+        plt.savefig(output_path, dpi=150, bbox_inches='tight')
+        plt.close()
+        
+        logger.info(f"Saved segment creation visualization to {output_path}")
+        return output_path
+    
+    def plot_segmentation_timeline(self, segments, peak_frames, video_info, 
+                                   cluster_labels=None, output_dir=None, video_name='video'):
+        """
+        Plots all segments on a timeline with color coding and annotations.
+        
+        Args:
+            segments: List of segment dictionaries
+            peak_frames: Dictionary of peak frames
+            video_info: Video information dictionary
+            cluster_labels: Optional cluster labels for color coding
+            output_dir: Directory to save visualization
+            video_name: Name of video for file naming
+        """
+        if output_dir is None:
+            output_dir = RESULTS_DIR
+        
+        os.makedirs(output_dir, exist_ok=True)
+        
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(20, 8), sharex=True)
+        
+        # Get color map
+        if cluster_labels:
+            unique_labels = sorted(set(cluster_labels))
+            colors = plt.cm.tab10(np.linspace(0, 1, len(unique_labels)))
+            label_to_color = {label: colors[i] for i, label in enumerate(unique_labels)}
+        else:
+            colors = plt.cm.viridis(np.linspace(0, 1, len(segments)))
+        
+        # Plot 1: Segments as horizontal bars
+        for i, seg in enumerate(segments):
+            start = seg['start_time']
+            duration = seg['duration']
+            
+            if cluster_labels and i < len(cluster_labels):
+                color = label_to_color[cluster_labels[i]]
+                label = f"Type {cluster_labels[i]}" if i == 0 or cluster_labels[i] != cluster_labels[i-1] else None
+            else:
+                color = colors[i]
+                label = None
+            
+            ax1.barh(0, duration, left=start, height=0.5, color=color, 
+                    edgecolor='black', linewidth=1, label=label, alpha=0.8)
+            
+            # Add segment ID text
+            ax1.text(start + duration/2, 0, str(seg['segment_id']), 
+                    ha='center', va='center', fontsize=8, weight='bold')
+        
+        # Mark segment boundaries
+        for seg in segments:
+            ax1.axvline(seg['start_time'], color='red', linestyle='--', alpha=0.5, linewidth=1)
+        
+        ax1.set_ylabel('Segments')
+        ax1.set_title('Video Segmentation Timeline')
+        ax1.set_yticks([])
+        ax1.set_xlim(0, video_info.get('duration', segments[-1]['end_time']))
+        if cluster_labels:
+            ax1.legend(loc='upper right')
+        ax1.grid(True, alpha=0.3, axis='x')
+        
+        # Plot 2: Eventfulness peaks
+        if peak_frames:
+            peak_times = [info['time'] for info in peak_frames.values()]
+            peak_values = [info.get('peak_value', info.get('eventfulness_value', 1.0)) 
+                          for info in peak_frames.values()]
+            
+            ax2.scatter(peak_times, peak_values, c='red', s=50, alpha=0.6, marker='^', 
+                       label='Eventfulness Peaks')
+            ax2.plot(peak_times, peak_values, 'r-', alpha=0.3)
+            
+            # Mark segment boundaries
+            for seg in segments:
+                ax2.axvline(seg['start_time'], color='blue', linestyle='--', alpha=0.3, linewidth=1)
+        
+        ax2.set_xlabel('Time (seconds)')
+        ax2.set_ylabel('Eventfulness')
+        ax2.set_title('Eventfulness Peaks and Segment Boundaries')
+        ax2.legend()
+        ax2.grid(True, alpha=0.3)
+        
+        plt.tight_layout()
+        
+        # Save figure
+        output_path = os.path.join(output_dir, f'segmentation_timeline_{video_name}.png')
+        plt.savefig(output_path, dpi=150, bbox_inches='tight')
+        plt.close()
+        
+        logger.info(f"Saved segmentation timeline to {output_path}")
+        return output_path
+    
+    def plot_segment_similarity_matrix(self, similarity_matrix, segments, 
+                                       output_dir=None, video_name='video'):
+        """
+        Plots heatmap of segment similarity matrix.
+        
+        Args:
+            similarity_matrix: Pairwise similarity matrix
+            segments: List of segment dictionaries
+            output_dir: Directory to save visualization
+            video_name: Name of video for file naming
+        """
+        if output_dir is None:
+            output_dir = RESULTS_DIR
+        
+        os.makedirs(output_dir, exist_ok=True)
+        
+        fig, ax = plt.subplots(figsize=(12, 10))
+        
+        # Create heatmap
+        im = ax.imshow(similarity_matrix, cmap='RdYlGn', aspect='auto', vmin=0, vmax=1)
+        
+        # Add colorbar
+        cbar = plt.colorbar(im, ax=ax)
+        cbar.set_label('Similarity', rotation=270, labelpad=20)
+        
+        # Set ticks
+        n = len(segments)
+        ax.set_xticks(range(n))
+        ax.set_yticks(range(n))
+        ax.set_xticklabels([seg['segment_id'] for seg in segments], rotation=45)
+        ax.set_yticklabels([seg['segment_id'] for seg in segments])
+        
+        # Add grid
+        ax.set_xticks(np.arange(n) - 0.5, minor=True)
+        ax.set_yticks(np.arange(n) - 0.5, minor=True)
+        ax.grid(which='minor', color='gray', linestyle='-', linewidth=0.5)
+        
+        ax.set_xlabel('Segment ID')
+        ax.set_ylabel('Segment ID')
+        ax.set_title(f'Segment Similarity Matrix - {video_name}')
+        
+        plt.tight_layout()
+        
+        # Save figure
+        output_path = os.path.join(output_dir, f'similarity_matrix_{video_name}.png')
+        plt.savefig(output_path, dpi=150, bbox_inches='tight')
+        plt.close()
+        
+        logger.info(f"Saved similarity matrix to {output_path}")
+        return output_path
+    
+    def plot_segment_comparisons(self, segments, indices_to_compare, 
+                                output_dir=None, video_name='video'):
+        """
+        Creates side-by-side pose trajectory comparisons for selected segments.
+        
+        Args:
+            segments: List of segment dictionaries
+            indices_to_compare: List of tuples (seg_idx1, seg_idx2) to compare
+            output_dir: Directory to save visualization
+            video_name: Name of video for file naming
+        """
+        if output_dir is None:
+            output_dir = RESULTS_DIR
+        
+        os.makedirs(output_dir, exist_ok=True)
+        
+        n_comparisons = len(indices_to_compare)
+        fig, axes = plt.subplots(n_comparisons, 2, figsize=(16, 4 * n_comparisons))
+        
+        if n_comparisons == 1:
+            axes = axes.reshape(1, -1)
+        
+        for i, (idx1, idx2) in enumerate(indices_to_compare):
+            seg1 = segments[idx1]
+            seg2 = segments[idx2]
+            
+            # Plot segment 1
+            ax1 = axes[i, 0]
+            if seg1['pose_vectors']:
+                pose_array1 = np.array(seg1['pose_vectors'])
+                for dim in range(min(5, pose_array1.shape[1])):
+                    ax1.plot(seg1['frame_numbers'], pose_array1[:, dim], 
+                            label=f'Dim {dim}', alpha=0.7)
+            ax1.set_xlabel('Frame Number')
+            ax1.set_ylabel('Pose Value')
+            ax1.set_title(f'Segment {seg1["segment_id"]} '
+                         f'({seg1["start_time"]:.1f}s - {seg1["end_time"]:.1f}s)')
+            ax1.legend(loc='upper right', fontsize=8)
+            ax1.grid(True, alpha=0.3)
+            
+            # Plot segment 2
+            ax2 = axes[i, 1]
+            if seg2['pose_vectors']:
+                pose_array2 = np.array(seg2['pose_vectors'])
+                for dim in range(min(5, pose_array2.shape[1])):
+                    ax2.plot(seg2['frame_numbers'], pose_array2[:, dim], 
+                            label=f'Dim {dim}', alpha=0.7)
+            ax2.set_xlabel('Frame Number')
+            ax2.set_ylabel('Pose Value')
+            ax2.set_title(f'Segment {seg2["segment_id"]} '
+                         f'({seg2["start_time"]:.1f}s - {seg2["end_time"]:.1f}s)')
+            ax2.legend(loc='upper right', fontsize=8)
+            ax2.grid(True, alpha=0.3)
+        
+        plt.suptitle(f'Segment Pose Trajectory Comparisons - {video_name}', 
+                    fontsize=16, weight='bold')
+        plt.tight_layout()
+        
+        # Save figure
+        output_path = os.path.join(output_dir, f'segment_comparisons_{video_name}.png')
+        plt.savefig(output_path, dpi=150, bbox_inches='tight')
+        plt.close()
+        
+        logger.info(f"Saved segment comparisons to {output_path}")
+        return output_path
+    
+    def visualize_merge_history(self, merge_history, initial_segments, final_segments,
+                               output_dir=None, video_name='video'):
+        """
+        Visualizes the step-by-step merge/split operations.
+        
+        Args:
+            merge_history: List of merge/split operations
+            initial_segments: Initial segment list
+            final_segments: Final segment list after refinement
+            output_dir: Directory to save visualization
+            video_name: Name of video for file naming
+        """
+        if output_dir is None:
+            output_dir = RESULTS_DIR
+        
+        os.makedirs(output_dir, exist_ok=True)
+        
+        if not merge_history:
+            logger.info("No merge history to visualize")
+            return None
+        
+        # Create figure showing merge operations
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(16, 10))
+        
+        # Plot 1: Timeline of merge operations
+        for i, operation in enumerate(merge_history):
+            iteration = operation.get('iteration', 0)
+            action = operation.get('action', 'unknown')
+            
+            if action == 'merge':
+                segments = operation.get('segments', [])
+                similarity = operation.get('similarity', 0)
+                
+                ax1.scatter(iteration, similarity, s=100, alpha=0.6)
+                ax1.text(iteration, similarity, f"{segments[0]}-{segments[1]}", 
+                        fontsize=8, ha='center', va='bottom')
+        
+        ax1.set_xlabel('Iteration')
+        ax1.set_ylabel('Similarity Score')
+        ax1.set_title('Merge Operations Over Iterations')
+        ax1.grid(True, alpha=0.3)
+        
+        # Plot 2: Segment count over iterations
+        iterations = [op.get('iteration', 0) for op in merge_history]
+        if iterations:
+            max_iter = max(iterations) + 1
+            segment_counts = [len(initial_segments)]
+            
+            for iter_num in range(max_iter):
+                merges_in_iter = sum(1 for op in merge_history 
+                                    if op.get('iteration') == iter_num and op.get('action') == 'merge')
+                segment_counts.append(segment_counts[-1] - merges_in_iter)
+            
+            ax2.plot(range(len(segment_counts)), segment_counts, 'bo-', linewidth=2, markersize=8)
+            ax2.set_xlabel('Iteration')
+            ax2.set_ylabel('Number of Segments')
+            ax2.set_title(f'Segment Count: {len(initial_segments)} → {len(final_segments)}')
+            ax2.grid(True, alpha=0.3)
+        
+        plt.tight_layout()
+        
+        # Save figure
+        output_path = os.path.join(output_dir, f'merge_history_{video_name}.png')
+        plt.savefig(output_path, dpi=150, bbox_inches='tight')
+        plt.close()
+        
+        logger.info(f"Saved merge history to {output_path}")
+        return output_path
+    
+    def visualize_iterative_segmentation(self, initial_segments, merge_history, strategy,
+                                        output_dir=None, video_name='video'):
+        """
+        Creates a comprehensive visualization showing every single merge/split iteration.
+        Each panel shows the state of segments at that iteration.
+        
+        Args:
+            initial_segments: List of initial segment dictionaries
+            merge_history: List of merge/split operations with iteration info
+            strategy: Name of the strategy used
+            output_dir: Directory to save visualization
+            video_name: Name of video for file naming
+            
+        Returns:
+            Path to saved visualization
+        """
+        if output_dir is None:
+            output_dir = RESULTS_DIR
+        
+        os.makedirs(output_dir, exist_ok=True)
+        
+        if not merge_history:
+            logger.info("No merge history to visualize")
+            return None
+        
+        logger.info(f"Creating iterative segmentation visualization for strategy: {strategy}")
+        
+        # Reconstruct segment state at each iteration
+        iterations_data = []
+        
+        # Iteration 0: Initial state
+        current_segments = [seg.copy() for seg in initial_segments]
+        for i, seg in enumerate(current_segments):
+            seg['display_id'] = i
+            seg['original_id'] = i
+        
+        iterations_data.append({
+            'iteration': 0,
+            'segments': [seg.copy() for seg in current_segments],
+            'operation': 'Initial segmentation from peaks',
+            'count': len(current_segments)
+        })
+        
+        # Group operations by iteration
+        max_iter = max(op.get('iteration', 0) for op in merge_history)
+        
+        for iter_num in range(max_iter + 1):
+            iter_ops = [op for op in merge_history if op.get('iteration') == iter_num]
+            
+            if not iter_ops:
+                continue
+            
+            # Apply operations for this iteration
+            for operation in iter_ops:
+                action = operation.get('action', 'unknown')
+                
+                if action == 'merge':
+                    seg_indices = operation.get('segments', [])
+                    similarity = operation.get('similarity', 0)
+                    
+                    if len(seg_indices) >= 2:
+                        # Find segments to merge
+                        seg1_idx = seg_indices[0]
+                        seg2_idx = seg_indices[1]
+                        
+                        # Merge them
+                        if seg1_idx < len(current_segments) and seg2_idx < len(current_segments):
+                            seg1 = current_segments[seg1_idx]
+                            seg2 = current_segments[seg2_idx]
+                            
+                            # Create merged segment
+                            merged = {
+                                'display_id': seg1.get('display_id', seg1_idx),
+                                'original_id': seg1.get('original_id', seg1_idx),
+                                'start_frame': seg1['start_frame'],
+                                'end_frame': seg2['end_frame'],
+                                'start_time': seg1['start_time'],
+                                'end_time': seg2['end_time'],
+                                'duration': seg2['end_time'] - seg1['start_time'],
+                                'merged_from': [seg1.get('display_id', seg1_idx), 
+                                              seg2.get('display_id', seg2_idx)],
+                                'similarity': similarity
+                            }
+                            
+                            # Replace first segment with merged, remove second
+                            current_segments[seg1_idx] = merged
+                            current_segments.pop(seg2_idx)
+                
+                elif action == 'split':
+                    seg_idx = operation.get('segment', 0)
+                    split_frame = operation.get('split_frame', 0)
+                    
+                    # Split logic would go here
+                    pass
+            
+            # Record state after this iteration
+            iterations_data.append({
+                'iteration': iter_num + 1,
+                'segments': [seg.copy() for seg in current_segments],
+                'operation': f"{len(iter_ops)} operation(s)",
+                'count': len(current_segments)
+            })
+        
+        # Create visualization with one panel per iteration
+        n_iterations = len(iterations_data)
+        n_cols = min(3, n_iterations)
+        n_rows = (n_iterations + n_cols - 1) // n_cols
+        
+        fig, axes = plt.subplots(n_rows, n_cols, figsize=(8 * n_cols, 4 * n_rows))
+        if n_iterations == 1:
+            axes = np.array([axes])
+        axes = axes.flatten()
+        
+        # Color map for segments
+        colors = plt.cm.tab20(np.linspace(0, 1, len(initial_segments)))
+        
+        for idx, iter_data in enumerate(iterations_data):
+            ax = axes[idx]
+            segments = iter_data['segments']
+            
+            # Draw each segment as a horizontal bar
+            for i, seg in enumerate(segments):
+                start = seg['start_time']
+                duration = seg['duration']
+                
+                # Use original ID for consistent coloring
+                orig_id = seg.get('original_id', i)
+                color = colors[orig_id % len(colors)]
+                
+                # Draw segment
+                ax.barh(0, duration, left=start, height=0.8, 
+                       color=color, edgecolor='black', linewidth=1.5, alpha=0.8)
+                
+                # Add segment label
+                label_text = str(seg.get('display_id', i))
+                if 'merged_from' in seg:
+                    label_text = f"{seg['merged_from'][0]}+{seg['merged_from'][1]}"
+                
+                ax.text(start + duration/2, 0, label_text,
+                       ha='center', va='center', fontsize=9, weight='bold',
+                       color='white' if np.mean(color[:3]) < 0.5 else 'black')
+            
+            # Mark boundaries
+            for seg in segments:
+                ax.axvline(seg['start_time'], color='red', linestyle='--', 
+                          alpha=0.3, linewidth=1)
+            
+            # Styling
+            ax.set_ylim(-0.5, 0.5)
+            ax.set_yticks([])
+            ax.set_xlabel('Time (seconds)', fontsize=10)
+            ax.set_title(f"Iteration {iter_data['iteration']}: {iter_data['count']} segments\n{iter_data['operation']}", 
+                        fontsize=11, weight='bold')
+            ax.grid(True, alpha=0.3, axis='x')
+            
+            # Set consistent x-axis limits
+            if segments:
+                max_time = max(seg['end_time'] for seg in segments)
+                ax.set_xlim(0, max_time * 1.05)
+        
+        # Hide unused subplots
+        for idx in range(n_iterations, len(axes)):
+            axes[idx].set_visible(False)
+        
+        plt.suptitle(f'Iterative Segmentation Process - {strategy}\n{video_name}', 
+                    fontsize=16, weight='bold', y=0.995)
+        plt.tight_layout()
+        
+        # Save figure
+        output_path = os.path.join(output_dir, f'iterative_segmentation_{strategy}_{video_name}.png')
+        plt.savefig(output_path, dpi=150, bbox_inches='tight')
+        plt.close()
+        
+        logger.info(f"Saved iterative segmentation visualization to {output_path}")
+        return output_path
+    
+    def plot_pose_change_detection(self, pose_data, change_points, segments,
+                                   output_dir=None, video_name='video'):
+        """
+        Highlights frames with significant pose changes.
+        
+        Args:
+            pose_data: Full pose data dictionary
+            change_points: List of change point dictionaries
+            segments: List of segment dictionaries
+            output_dir: Directory to save visualization
+            video_name: Name of video for file naming
+        """
+        if output_dir is None:
+            output_dir = RESULTS_DIR
+        
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # Calculate frame-to-frame differences
+        sorted_frames = sorted(pose_data.items(), 
+                              key=lambda x: pose_data[x[0]]['frame_number'])
+        
+        pose_vectors = []
+        frame_numbers = []
+        times = []
+        
+        for frame_key, frame_data in sorted_frames:
+            pose_vec = frame_data.get('pose_vector')
+            if pose_vec is not None:
+                pose_vectors.append(pose_vec)
+                frame_numbers.append(frame_data['frame_number'])
+                times.append(frame_data['time'])
+        
+        if len(pose_vectors) < 2:
+            return None
+        
+        pose_array = np.array(pose_vectors)
+        diffs = np.linalg.norm(np.diff(pose_array, axis=0), axis=1)
+        
+        # Create visualization
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(20, 10), sharex=True)
+        
+        # Plot 1: Pose change magnitude over time
+        ax1.plot(times[:-1], diffs, 'b-', alpha=0.5, linewidth=1)
+        ax1.fill_between(times[:-1], diffs, alpha=0.3)
+        
+        # Mark change points
+        if change_points:
+            change_times = [cp['time'] for cp in change_points]
+            change_mags = [cp['pose_change_magnitude'] for cp in change_points]
+            ax1.scatter(change_times, change_mags, c='red', s=100, 
+                       marker='*', label='Significant Changes', zorder=5)
+        
+        # Mark segment boundaries
+        for seg in segments:
+            ax1.axvline(seg['start_time'], color='green', linestyle='--', 
+                       alpha=0.5, linewidth=1.5)
+        
+        ax1.set_ylabel('Pose Change Magnitude')
+        ax1.set_title('Frame-to-Frame Pose Changes')
+        ax1.legend()
+        ax1.grid(True, alpha=0.3)
+        
+        # Plot 2: Segments timeline
+        for i, seg in enumerate(segments):
+            color = plt.cm.viridis(i / len(segments))
+            ax2.barh(0, seg['duration'], left=seg['start_time'], height=0.5, 
+                    color=color, edgecolor='black', linewidth=1, alpha=0.8)
+            ax2.text(seg['start_time'] + seg['duration']/2, 0, str(seg['segment_id']), 
+                    ha='center', va='center', fontsize=8, weight='bold')
+        
+        ax2.set_xlabel('Time (seconds)')
+        ax2.set_ylabel('Segments')
+        ax2.set_yticks([])
+        ax2.set_title('Segment Boundaries')
+        ax2.grid(True, alpha=0.3, axis='x')
+        
+        plt.tight_layout()
+        
+        # Save figure
+        output_path = os.path.join(output_dir, f'pose_change_detection_{video_name}.png')
+        plt.savefig(output_path, dpi=150, bbox_inches='tight')
+        plt.close()
+        
+        logger.info(f"Saved pose change detection to {output_path}")
+        return output_path
+    
+    def plot_threshold_analysis(self, similarity_matrix, threshold, method='otsu',
+                               output_dir=None, video_name='video'):
+        """
+        Shows how the adaptive threshold was determined.
+        
+        Args:
+            similarity_matrix: Pairwise similarity matrix
+            threshold: Calculated threshold value
+            method: Method used for threshold calculation
+            output_dir: Directory to save visualization
+            video_name: Name of video for file naming
+        """
+        if output_dir is None:
+            output_dir = RESULTS_DIR
+        
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # Extract similarities (excluding diagonal)
+        n = similarity_matrix.shape[0]
+        mask = ~np.eye(n, dtype=bool)
+        similarities = similarity_matrix[mask].flatten()
+        
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
+        
+        # Plot 1: Histogram of similarities
+        ax1.hist(similarities, bins=50, alpha=0.7, color='blue', edgecolor='black')
+        ax1.axvline(threshold, color='red', linestyle='--', linewidth=2, 
+                   label=f'Threshold = {threshold:.3f}')
+        ax1.axvline(np.mean(similarities), color='green', linestyle=':', linewidth=2, 
+                   label=f'Mean = {np.mean(similarities):.3f}')
+        ax1.axvline(np.median(similarities), color='orange', linestyle=':', linewidth=2, 
+                   label=f'Median = {np.median(similarities):.3f}')
+        
+        ax1.set_xlabel('Similarity Score')
+        ax1.set_ylabel('Frequency')
+        ax1.set_title(f'Similarity Distribution (Method: {method})')
+        ax1.legend()
+        ax1.grid(True, alpha=0.3, axis='y')
+        
+        # Plot 2: Cumulative distribution
+        sorted_sims = np.sort(similarities)
+        cumulative = np.arange(1, len(sorted_sims) + 1) / len(sorted_sims)
+        
+        ax2.plot(sorted_sims, cumulative, 'b-', linewidth=2)
+        ax2.axvline(threshold, color='red', linestyle='--', linewidth=2, 
+                   label=f'Threshold = {threshold:.3f}')
+        ax2.axhline(0.5, color='gray', linestyle=':', alpha=0.5)
+        
+        # Mark threshold position on CDF
+        threshold_percentile = np.sum(similarities < threshold) / len(similarities) * 100
+        ax2.scatter([threshold], [threshold_percentile/100], c='red', s=100, zorder=5)
+        ax2.text(threshold, threshold_percentile/100 + 0.05, 
+                f'{threshold_percentile:.1f}th percentile', ha='center')
+        
+        ax2.set_xlabel('Similarity Score')
+        ax2.set_ylabel('Cumulative Probability')
+        ax2.set_title('Cumulative Distribution Function')
+        ax2.legend()
+        ax2.grid(True, alpha=0.3)
+        
+        plt.tight_layout()
+        
+        # Save figure
+        output_path = os.path.join(output_dir, f'threshold_analysis_{video_name}.png')
+        plt.savefig(output_path, dpi=150, bbox_inches='tight')
+        plt.close()
+        
+        logger.info(f"Saved threshold analysis to {output_path}")
+        return output_path
+    
+    def plot_peak_segmentation_results(self, segments, merge_results, similarities, peak_frames, 
+                                       output_dir=None, video_name='video'):
+        """
+        Visualizes peak-based segmentation results with merge history.
+        
+        Args:
+            segments: Initial segments from peaks
+            merge_results: Results from merge_similar_segments
+            similarities: Cosine similarity data
+            peak_frames: Peak frames dictionary
+            output_dir: Directory to save visualization
+            video_name: Name of video for file naming
+        """
+        if output_dir is None:
+            output_dir = RESULTS_DIR
+        
+        os.makedirs(output_dir, exist_ok=True)
+        
+        fig = plt.figure(figsize=(20, 12))
+        gs = fig.add_gridspec(4, 2, hspace=0.3, wspace=0.3)
+        
+        # Get cluster IDs
+        first_sim_key = list(similarities.keys())[0]
+        cluster_ids = sorted(list(similarities[first_sim_key]['similarities'].keys()))
+        
+        # Plot 1: Initial segments timeline
+        ax1 = fig.add_subplot(gs[0, :])
+        colors_initial = plt.cm.viridis(np.linspace(0, 1, len(segments)))
+        for i, seg in enumerate(segments):
+            ax1.barh(0, seg['duration'], left=seg['start_time'], height=0.5,
+                    color=colors_initial[i], edgecolor='black', linewidth=1, alpha=0.8)
+            ax1.text(seg['start_time'] + seg['duration']/2, 0, str(seg['segment_id']),
+                    ha='center', va='center', fontsize=8, weight='bold')
+        
+        # Mark peaks
+        for peak_idx, peak_info in peak_frames.items():
+            ax1.axvline(peak_info['time'], color='red', linestyle='--', alpha=0.3, linewidth=1)
+        
+        ax1.set_ylabel('Initial Segments')
+        ax1.set_title(f'Initial Segmentation by Peaks ({len(segments)} segments)')
+        ax1.set_yticks([])
+        ax1.grid(True, alpha=0.3, axis='x')
+        
+        # Plot 2: Final segments timeline (after merging)
+        ax2 = fig.add_subplot(gs[1, :])
+        final_segments = merge_results['segments'] if merge_results else segments
+        colors_final = plt.cm.plasma(np.linspace(0, 1, len(final_segments)))
+        for i, seg in enumerate(final_segments):
+            ax2.barh(0, seg['duration'], left=seg['start_time'], height=0.5,
+                    color=colors_final[i], edgecolor='black', linewidth=1.5, alpha=0.8)
+            ax2.text(seg['start_time'] + seg['duration']/2, 0, str(seg['segment_id']),
+                    ha='center', va='center', fontsize=8, weight='bold')
+        
+        ax2.set_ylabel('Final Segments')
+        ax2.set_title(f'Final Segmentation After Merging ({len(final_segments)} segments)')
+        ax2.set_yticks([])
+        ax2.grid(True, alpha=0.3, axis='x')
+        
+        # Plot 3: Merge history
+        if merge_results and merge_results['merge_history']:
+            ax3 = fig.add_subplot(gs[2, 0])
+            merge_hist = merge_results['merge_history']
+            passes = [m['pass'] for m in merge_hist]
+            similarities_hist = [m['similarity'] for m in merge_hist]
+            
+            ax3.scatter(passes, similarities_hist, s=100, alpha=0.6, c=passes, cmap='coolwarm')
+            ax3.axhline(y=merge_results['similarity_threshold'], color='red', 
+                       linestyle='--', label=f"Threshold={merge_results['similarity_threshold']:.2f}")
+            ax3.set_xlabel('Pass Number')
+            ax3.set_ylabel('Segment Similarity')
+            ax3.set_title('Merge Operations by Pass')
+            ax3.legend()
+            ax3.grid(True, alpha=0.3)
+        
+        # Plot 4: Segment count over passes
+        if merge_results:
+            ax4 = fig.add_subplot(gs[2, 1])
+            num_passes = merge_results['num_passes']
+            
+            # Calculate segment count at each pass
+            segment_counts = [merge_results['initial_count']]
+            for pass_num in range(num_passes):
+                merges_in_pass = sum(1 for m in merge_results['merge_history'] if m['pass'] == pass_num)
+                segment_counts.append(segment_counts[-1] - merges_in_pass)
+            
+            ax4.plot(range(len(segment_counts)), segment_counts, 'bo-', linewidth=2, markersize=8)
+            ax4.set_xlabel('Pass Number')
+            ax4.set_ylabel('Number of Segments')
+            ax4.set_title(f"Segment Count: {merge_results['initial_count']} → {merge_results['final_count']}")
+            ax4.grid(True, alpha=0.3)
+        
+        # Plot 5: Mean similarity patterns for final segments
+        ax5 = fig.add_subplot(gs[3, :])
+        for i, seg in enumerate(final_segments[:min(10, len(final_segments))]):  # Show first 10
+            if seg.get('mean_similarity'):
+                mean_sim = seg['mean_similarity']
+                ax5.plot(range(len(mean_sim)), mean_sim, 
+                        label=f"Seg {seg['segment_id']}", alpha=0.7, linewidth=2)
+        
+        ax5.set_xlabel('Cluster ID')
+        ax5.set_ylabel('Mean Similarity')
+        ax5.set_title('Mean Similarity Patterns for Final Segments')
+        ax5.legend(loc='upper right', ncol=2, fontsize=8)
+        ax5.grid(True, alpha=0.3)
+        
+        plt.suptitle(f'Peak-Based Segmentation Results - {video_name}', 
+                    fontsize=16, weight='bold')
+        
+        # Save figure
+        output_path = os.path.join(output_dir, f'peak_segmentation_results_{video_name}.png')
+        plt.savefig(output_path, dpi=150, bbox_inches='tight')
+        plt.close()
+        
+        logger.info(f"Saved peak segmentation results to {output_path}")
+        return output_path
+    
+    def plot_segment_statistics(self, segments, output_dir=None, video_name='video'):
+        """
+        Creates box plots and distribution plots for segment statistics.
+        
+        Args:
+            segments: List of segment dictionaries
+            output_dir: Directory to save visualization
+            video_name: Name of video for file naming
+        """
+        if output_dir is None:
+            output_dir = RESULTS_DIR
+        
+        os.makedirs(output_dir, exist_ok=True)
+        
+        fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+        
+        # Extract statistics
+        durations = [seg['duration'] for seg in segments]
+        num_frames = [seg['num_frames'] for seg in segments]
+        
+        # Plot 1: Duration distribution
+        axes[0, 0].hist(durations, bins=20, alpha=0.7, color='blue', edgecolor='black')
+        axes[0, 0].set_xlabel('Duration (seconds)')
+        axes[0, 0].set_ylabel('Frequency')
+        axes[0, 0].set_title('Segment Duration Distribution')
+        axes[0, 0].axvline(np.mean(durations), color='red', linestyle='--', 
+                          label=f'Mean = {np.mean(durations):.2f}s')
+        axes[0, 0].legend()
+        axes[0, 0].grid(True, alpha=0.3, axis='y')
+        
+        # Plot 2: Frame count distribution
+        axes[0, 1].hist(num_frames, bins=20, alpha=0.7, color='green', edgecolor='black')
+        axes[0, 1].set_xlabel('Number of Frames')
+        axes[0, 1].set_ylabel('Frequency')
+        axes[0, 1].set_title('Segment Frame Count Distribution')
+        axes[0, 1].axvline(np.mean(num_frames), color='red', linestyle='--', 
+                          label=f'Mean = {np.mean(num_frames):.1f}')
+        axes[0, 1].legend()
+        axes[0, 1].grid(True, alpha=0.3, axis='y')
+        
+        # Plot 3: Box plot of durations
+        axes[0, 2].boxplot(durations, vert=True)
+        axes[0, 2].set_ylabel('Duration (seconds)')
+        axes[0, 2].set_title('Segment Duration Box Plot')
+        axes[0, 2].grid(True, alpha=0.3, axis='y')
+        
+        # Plot 4: Mean pose variance per segment
+        mean_variances = []
+        for seg in segments:
+            if seg.get('std_pose'):
+                mean_var = np.mean(seg['std_pose'])
+                mean_variances.append(mean_var)
+        
+        if mean_variances:
+            axes[1, 0].bar(range(len(mean_variances)), mean_variances, alpha=0.7, color='purple')
+            axes[1, 0].set_xlabel('Segment ID')
+            axes[1, 0].set_ylabel('Mean Pose Variance')
+            axes[1, 0].set_title('Pose Variance by Segment')
+            axes[1, 0].grid(True, alpha=0.3, axis='y')
+        
+        # Plot 5: Segment timeline
+        for i, seg in enumerate(segments):
+            color = plt.cm.viridis(i / len(segments))
+            axes[1, 1].barh(i, seg['duration'], left=seg['start_time'], 
+                           color=color, edgecolor='black', alpha=0.7)
+        axes[1, 1].set_xlabel('Time (seconds)')
+        axes[1, 1].set_ylabel('Segment ID')
+        axes[1, 1].set_title('Segment Timeline')
+        axes[1, 1].grid(True, alpha=0.3, axis='x')
+        
+        # Plot 6: Summary statistics table
+        axes[1, 2].axis('off')
+        summary_text = f"""
+        Summary Statistics
+        ==================
+        Total Segments: {len(segments)}
+        
+        Duration:
+          Mean: {np.mean(durations):.2f}s
+          Std: {np.std(durations):.2f}s
+          Min: {np.min(durations):.2f}s
+          Max: {np.max(durations):.2f}s
+        
+        Frame Count:
+          Mean: {np.mean(num_frames):.1f}
+          Std: {np.std(num_frames):.1f}
+          Min: {np.min(num_frames)}
+          Max: {np.max(num_frames)}
+        """
+        axes[1, 2].text(0.1, 0.5, summary_text, fontsize=10, family='monospace',
+                       va='center', transform=axes[1, 2].transAxes)
+        
+        plt.suptitle(f'Segment Statistics - {video_name}', fontsize=16, weight='bold')
+        plt.tight_layout()
+        
+        # Save figure
+        output_path = os.path.join(output_dir, f'segment_statistics_{video_name}.png')
+        plt.savefig(output_path, dpi=150, bbox_inches='tight')
+        plt.close()
+        
+        logger.info(f"Saved segment statistics to {output_path}")
+        return output_path
+    
+    def handle_pose_segmentation(self, peak_frames, pose_data, video_info, video_path,
+                                 comparison_method='cosine', threshold_strategy='adaptive',
+                                 recursive_strategies=None, similarity_threshold=0.7,
+                                 output_formats=None, create_visualizations=True,
+                                 output_dir=None):
+        """
+        Main method for pose-based segmentation pipeline.
+        
+        Segments video from peak to peak, compares segments, and recursively refines.
+        
+        Args:
+            peak_frames: Dictionary of peak frames from eventfulness detection
+            pose_data: Dictionary of frame-by-frame pose estimation data
+            video_info: Video information dictionary
+            video_path: Path to video file
+            comparison_method: 'cosine', 'dtw', 'statistical', 'frechet', or 'all'
+            threshold_strategy: 'fixed', 'adaptive', 'clustering', or 'statistical_test'
+            recursive_strategies: List of strategies to apply (default: ['merge_similar'])
+            similarity_threshold: Fixed threshold if using 'fixed' strategy
+            output_formats: List of output formats to generate
+            create_visualizations: Whether to create visualization plots
+            output_dir: Directory for outputs (default: RESULTS_DIR)
+            
+        Returns:
+            Dictionary containing all segmentation results:
+            {
+                'initial_segments': list,
+                'similarity_matrix': array,
+                'threshold': float,
+                'refined_segments': dict (keyed by strategy),
+                'output_formats': dict,
+                'visualizations': dict (paths to visualization files)
+            }
+        """
+        if output_dir is None:
+            output_dir = RESULTS_DIR
+        
+        os.makedirs(output_dir, exist_ok=True)
+        
+        if recursive_strategies is None:
+            recursive_strategies = ['merge_similar']
+        
+        if output_formats is None:
+            output_formats = ['boundaries', 'labels', 'change_points']
+        
+        video_name = os.path.basename(video_path).replace('.mp4', '').replace('.', '_')
+        
+        logger.info("="*80)
+        logger.info("STARTING POSE-BASED SEGMENTATION PIPELINE")
+        logger.info("="*80)
+        logger.info(f"Video: {video_path}")
+        logger.info(f"Comparison method: {comparison_method}")
+        logger.info(f"Threshold strategy: {threshold_strategy}")
+        logger.info(f"Recursive strategies: {recursive_strategies}")
+        logger.info(f"Output formats: {output_formats}")
+        
+        results = {
+            'video_path': video_path,
+            'video_name': video_name,
+            'parameters': {
+                'comparison_method': comparison_method,
+                'threshold_strategy': threshold_strategy,
+                'recursive_strategies': recursive_strategies,
+                'similarity_threshold': similarity_threshold,
+                'output_formats': output_formats
+            }
+        }
+        
+        # Step 1: Create initial segments from peak to peak
+        logger.info("\n" + "="*80)
+        logger.info("STEP 1: Creating initial segments from eventfulness peaks")
+        logger.info("="*80)
+        
+        initial_segments = self.segment_by_eventfulness_peaks(peak_frames, pose_data)
+        
+        if not initial_segments:
+            logger.error("Failed to create initial segments")
+            return None
+        
+        logger.info(f"Created {len(initial_segments)} initial segments")
+        results['initial_segments'] = initial_segments
+        
+        # Step 2: Compute similarity matrix
+        logger.info("\n" + "="*80)
+        logger.info(f"STEP 2: Computing segment similarity matrix using {comparison_method}")
+        logger.info("="*80)
+        
+        similarity_matrix, distance_matrix, comparison_details = \
+            self.compute_segment_similarity_matrix(initial_segments, comparison_method)
+        
+        if similarity_matrix is None:
+            logger.error("Failed to compute similarity matrix")
+            return None
+        
+        logger.info(f"Computed {similarity_matrix.shape[0]}x{similarity_matrix.shape[1]} similarity matrix")
+        logger.info(f"Similarity range: [{np.min(similarity_matrix):.3f}, {np.max(similarity_matrix):.3f}]")
+        logger.info(f"Mean similarity: {np.mean(similarity_matrix):.3f}")
+        
+        results['similarity_matrix'] = similarity_matrix
+        results['distance_matrix'] = distance_matrix
+        results['comparison_details'] = comparison_details
+        
+        # Step 3: Calculate threshold
+        logger.info("\n" + "="*80)
+        logger.info(f"STEP 3: Calculating threshold using {threshold_strategy} strategy")
+        logger.info("="*80)
+        
+        if threshold_strategy == 'fixed':
+            threshold = similarity_threshold
+            logger.info(f"Using fixed threshold: {threshold:.3f}")
+        else:
+            # Map strategy names
+            method_map = {
+                'adaptive': 'otsu',
+                'clustering': 'kmeans',
+                'statistical_test': 'statistical'
+            }
+            threshold_method = method_map.get(threshold_strategy, 'otsu')
+            threshold = self.calculate_adaptive_threshold(similarity_matrix, method=threshold_method)
+            logger.info(f"Calculated adaptive threshold: {threshold:.3f}")
+        
+        results['threshold'] = threshold
+        
+        # Step 4: Apply recursive refinement strategies
+        logger.info("\n" + "="*80)
+        logger.info("STEP 4: Applying recursive refinement strategies")
+        logger.info("="*80)
+        
+        refined_results = {}
+        
+        for strategy in recursive_strategies:
+            logger.info(f"\nApplying strategy: {strategy}")
+            logger.info("-" * 40)
+            
+            refinement_result = self.recursive_segment_refinement(
+                initial_segments, similarity_matrix, threshold, strategy=strategy)
+            
+            if refinement_result:
+                refined_results[strategy] = refinement_result
+                final_segs = refinement_result['final_segments']
+                logger.info(f"Strategy '{strategy}': {len(initial_segments)} → {len(final_segs)} segments")
+                logger.info(f"Iterations: {refinement_result['iteration_count']}")
+                logger.info(f"Merge operations: {len(refinement_result['merge_history'])}")
+            else:
+                logger.warning(f"Strategy '{strategy}' failed")
+        
+        results['refined_segments'] = refined_results
+        
+        # Step 5: Generate output formats
+        logger.info("\n" + "="*80)
+        logger.info("STEP 5: Generating output formats")
+        logger.info("="*80)
+        
+        output_data = {}
+        
+        # Use the first refined result, or initial segments if no refinement
+        primary_segments = (list(refined_results.values())[0]['final_segments'] 
+                          if refined_results else initial_segments)
+        
+        if 'boundaries' in output_formats:
+            logger.info("Generating boundaries output...")
+            output_data['boundaries'] = self.get_segments_with_boundaries(primary_segments)
+        
+        if 'labels' in output_formats:
+            logger.info("Generating labels output...")
+            output_data['labels'] = self.get_segments_with_labels(
+                primary_segments, similarity_matrix)
+        
+        if 'change_points' in output_formats:
+            logger.info("Generating change points output...")
+            output_data['change_points'] = self.get_change_points(
+                primary_segments, pose_data)
+        
+        results['output_formats'] = output_data
+        
+        # Step 6: Create visualizations
+        if create_visualizations:
+            logger.info("\n" + "="*80)
+            logger.info("STEP 6: Creating visualizations")
+            logger.info("="*80)
+            
+            viz_paths = {}
+            
+            # Timeline visualization
+            logger.info("Creating segmentation timeline...")
+            cluster_labels = None
+            if 'labels' in output_data:
+                cluster_labels = [seg.get('cluster_label', 0) for seg in output_data['labels']]
+            
+            viz_paths['timeline'] = self.plot_segmentation_timeline(
+                primary_segments, peak_frames, video_info, cluster_labels, output_dir, video_name)
+            
+            # Similarity matrix
+            logger.info("Creating similarity matrix heatmap...")
+            viz_paths['similarity_matrix'] = self.plot_segment_similarity_matrix(
+                similarity_matrix, primary_segments, output_dir, video_name)
+            
+            # Threshold analysis
+            logger.info("Creating threshold analysis...")
+            viz_paths['threshold_analysis'] = self.plot_threshold_analysis(
+                similarity_matrix, threshold, threshold_strategy, output_dir, video_name)
+            
+            # Segment statistics
+            logger.info("Creating segment statistics...")
+            viz_paths['statistics'] = self.plot_segment_statistics(
+                primary_segments, output_dir, video_name)
+            
+            # Pose change detection
+            if 'change_points' in output_data:
+                logger.info("Creating pose change detection plot...")
+                viz_paths['pose_changes'] = self.plot_pose_change_detection(
+                    pose_data, output_data['change_points'], primary_segments, 
+                    output_dir, video_name)
+            
+            # Merge history and iterative visualization (if available)
+            for strategy, refinement in refined_results.items():
+                if refinement.get('merge_history'):
+                    logger.info(f"Creating merge history for strategy '{strategy}'...")
+                    viz_paths[f'merge_history_{strategy}'] = self.visualize_merge_history(
+                        refinement['merge_history'], initial_segments, 
+                        refinement['final_segments'], output_dir, f"{video_name}_{strategy}")
+                    
+                    # Create iterative visualization showing each step
+                    logger.info(f"Creating iterative segmentation visualization for strategy '{strategy}'...")
+                    viz_paths[f'iterative_{strategy}'] = self.visualize_iterative_segmentation(
+                        initial_segments, refinement['merge_history'], strategy,
+                        output_dir, video_name)
+            
+            # Segment comparisons (compare a few interesting pairs)
+            logger.info("Creating segment comparisons...")
+            # Find most similar and most different pairs
+            n = len(primary_segments)
+            if n > 1:
+                # Get upper triangle indices
+                triu_indices = np.triu_indices(n, k=1)
+                triu_similarities = similarity_matrix[triu_indices]
+                
+                # Find most similar pair
+                most_similar_idx = np.argmax(triu_similarities)
+                most_similar_pair = (triu_indices[0][most_similar_idx], 
+                                    triu_indices[1][most_similar_idx])
+                
+                # Find most different pair
+                most_different_idx = np.argmin(triu_similarities)
+                most_different_pair = (triu_indices[0][most_different_idx], 
+                                      triu_indices[1][most_different_idx])
+                
+                comparison_pairs = [most_similar_pair, most_different_pair]
+                
+                # Add a few random pairs
+                if n > 4:
+                    random_indices = np.random.choice(len(triu_similarities), 
+                                                     size=min(2, len(triu_similarities)), 
+                                                     replace=False)
+                    for idx in random_indices:
+                        comparison_pairs.append((triu_indices[0][idx], triu_indices[1][idx]))
+                
+                viz_paths['comparisons'] = self.plot_segment_comparisons(
+                    primary_segments, comparison_pairs, output_dir, video_name)
+            
+            # Individual segment creation visualizations (for first few segments)
+            logger.info("Creating individual segment visualizations...")
+            for i in range(min(5, len(primary_segments))):
+                seg = primary_segments[i]
+                
+                # Get adjacent segments
+                adjacent = {
+                    'prev': primary_segments[i-1] if i > 0 else None,
+                    'next': primary_segments[i+1] if i < len(primary_segments)-1 else None
+                }
+                
+                # Get comparison results
+                comparisons = {}
+                if adjacent['prev']:
+                    comparisons['prev'] = self.compare_pose_segments(
+                        seg, adjacent['prev'], method=comparison_method)
+                if adjacent['next']:
+                    comparisons['next'] = self.compare_pose_segments(
+                        seg, adjacent['next'], method=comparison_method)
+                
+                viz_paths[f'segment_{i}'] = self.visualize_segment_creation(
+                    seg, adjacent, comparisons, output_dir, video_name)
+            
+            results['visualizations'] = viz_paths
+            logger.info(f"Created {len(viz_paths)} visualization files")
+        
+        # Step 7: Save results to JSON
+        logger.info("\n" + "="*80)
+        logger.info("STEP 7: Saving results to JSON")
+        logger.info("="*80)
+        
+        # Helper function to convert numpy types to Python types for JSON serialization
+        def convert_to_json_serializable(obj):
+            """Recursively convert numpy types to Python native types."""
+            if isinstance(obj, np.integer):
+                return int(obj)
+            elif isinstance(obj, np.floating):
+                return float(obj)
+            elif isinstance(obj, np.ndarray):
+                return obj.tolist()
+            elif isinstance(obj, dict):
+                return {k: convert_to_json_serializable(v) for k, v in obj.items()}
+            elif isinstance(obj, list):
+                return [convert_to_json_serializable(item) for item in obj]
+            else:
+                return obj
+        
+        # Prepare JSON-serializable results
+        json_results = {
+            'video_path': video_path,
+            'video_name': video_name,
+            'parameters': results['parameters'],
+            'initial_segment_count': len(initial_segments),
+            'threshold': float(threshold),
+            'initial_segments': [
+                {k: convert_to_json_serializable(v) for k, v in seg.items() if k not in ['pose_vectors']}
+                for seg in initial_segments
+            ],
+            'refined_segments': {
+                strategy: {
+                    'final_count': len(ref['final_segments']),
+                    'iteration_count': ref['iteration_count'],
+                    'merge_history': convert_to_json_serializable(ref['merge_history']),
+                    'segments': [
+                        {k: convert_to_json_serializable(v) for k, v in seg.items() if k not in ['pose_vectors']}
+                        for seg in ref['final_segments']
+                    ]
+                }
+                for strategy, ref in refined_results.items()
+            },
+            'output_formats': {
+                'boundaries': convert_to_json_serializable(output_data.get('boundaries', [])),
+                'labels': [
+                    {k: convert_to_json_serializable(v) for k, v in seg.items() if k not in ['pose_vectors']}
+                    for seg in output_data.get('labels', [])
+                ],
+                'change_points': convert_to_json_serializable(output_data.get('change_points', []))
+            }
+        }
+        
+        if create_visualizations:
+            json_results['visualizations'] = results.get('visualizations', {})
+        
+        json_path = os.path.join(output_dir, f'pose_segmentation_results_{video_name}.json')
+        with open(json_path, 'w') as f:
+            json.dump(json_results, f, indent=2)
+        
+        logger.info(f"Saved results to {json_path}")
+        results['json_path'] = json_path
+        
+        logger.info("\n" + "="*80)
+        logger.info("POSE-BASED SEGMENTATION PIPELINE COMPLETED")
+        logger.info("="*80)
+        logger.info(f"Initial segments: {len(initial_segments)}")
+        for strategy, ref in refined_results.items():
+            logger.info(f"Final segments ({strategy}): {len(ref['final_segments'])}")
+        logger.info(f"Output directory: {output_dir}")
+        logger.info("="*80 + "\n")
+        
+        return results
+    
+    def handle_peak_based_segmentation(self, similarities, peak_frames, similarity_threshold=0.8, 
+                                       max_passes=10, comparison_method='mean_cosine',
+                                       create_visualizations=True, output_dir=None, video_name='video'):
+        """
+        Main handler for peak-based segmentation workflow.
+        
+        1. Segments time series by eventfulness peaks
+        2. Compares each segment with nearby neighbors
+        3. Iteratively merges similar segments
+        
+        Args:
+            similarities: Cosine similarity data
+            peak_frames: Peak frames from eventfulness detection
+            similarity_threshold: Threshold for merging segments (0-1)
+            max_passes: Maximum number of merge passes
+            comparison_method: Method for comparing segments ('mean_cosine', 'dtw', 'correlation')
+            create_visualizations: Whether to create visualization plots
+            output_dir: Directory for outputs
+            video_name: Name of video for file naming
+            
+        Returns:
+            Dictionary containing segmentation results
+        """
+        if output_dir is None:
+            output_dir = RESULTS_DIR
+        
+        os.makedirs(output_dir, exist_ok=True)
+        
+        logger.info("="*80)
+        logger.info("STARTING PEAK-BASED SEGMENTATION")
+        logger.info("="*80)
+        logger.info(f"Similarity threshold: {similarity_threshold}")
+        logger.info(f"Max passes: {max_passes}")
+        logger.info(f"Comparison method: {comparison_method}")
+        
+        results = {
+            'video_name': video_name,
+            'parameters': {
+                'similarity_threshold': similarity_threshold,
+                'max_passes': max_passes,
+                'comparison_method': comparison_method
+            }
+        }
+        
+        # Step 1: Segment by peaks
+        logger.info("\n" + "="*80)
+        logger.info("STEP 1: Segmenting time series by eventfulness peaks")
+        logger.info("="*80)
+        
+        initial_segments = self.segment_by_peaks(similarities, peak_frames)
+        
+        if not initial_segments:
+            logger.error("Failed to create initial segments from peaks")
+            return None
+        
+        logger.info(f"Created {len(initial_segments)} initial segments from peaks")
+        results['initial_segments'] = initial_segments
+        results['initial_segment_count'] = len(initial_segments)
+        
+        # Step 2: Merge similar segments
+        logger.info("\n" + "="*80)
+        logger.info("STEP 2: Merging similar adjacent segments")
+        logger.info("="*80)
+        
+        merge_results = self.merge_similar_segments(
+            initial_segments,
+            similarity_threshold=similarity_threshold,
+            max_passes=max_passes,
+            comparison_method=comparison_method
+        )
+        
+        if not merge_results:
+            logger.error("Failed to merge segments")
+            return None
+        
+        logger.info(f"Merging completed: {merge_results['initial_count']} → {merge_results['final_count']} segments")
+        logger.info(f"Number of passes: {merge_results['num_passes']}")
+        logger.info(f"Number of merges: {len(merge_results['merge_history'])}")
+        
+        results['merge_results'] = merge_results
+        results['final_segments'] = merge_results['segments']
+        results['final_segment_count'] = merge_results['final_count']
+        
+        # Step 3: Create visualizations
+        if create_visualizations:
+            logger.info("\n" + "="*80)
+            logger.info("STEP 3: Creating visualizations")
+            logger.info("="*80)
+            
+            viz_path = self.plot_peak_segmentation_results(
+                initial_segments,
+                merge_results,
+                similarities,
+                peak_frames,
+                output_dir,
+                video_name
+            )
+            
+            results['visualization_path'] = viz_path
+            logger.info(f"Saved visualization to: {viz_path}")
+        
+        # Step 4: Save results to JSON
+        logger.info("\n" + "="*80)
+        logger.info("STEP 4: Saving results to JSON")
+        logger.info("="*80)
+        
+        # Prepare JSON-serializable results
+        json_results = {
+            'video_name': video_name,
+            'parameters': results['parameters'],
+            'initial_segment_count': results['initial_segment_count'],
+            'final_segment_count': results['final_segment_count'],
+            'num_passes': merge_results['num_passes'],
+            'num_merges': len(merge_results['merge_history']),
+            'initial_segments': [
+                {k: v for k, v in seg.items() if k != 'similarity_vectors'}
+                for seg in initial_segments
+            ],
+            'final_segments': [
+                {k: v for k, v in seg.items() if k != 'similarity_vectors'}
+                for seg in merge_results['segments']
+            ],
+            'merge_history': merge_results['merge_history']
+        }
+        
+        if create_visualizations:
+            json_results['visualization_path'] = results.get('visualization_path')
+        
+        json_path = os.path.join(output_dir, f'peak_segmentation_{video_name}.json')
+        with open(json_path, 'w') as f:
+            json.dump(json_results, f, indent=2)
+        
+        logger.info(f"Saved results to {json_path}")
+        results['json_path'] = json_path
+        
+        logger.info("\n" + "="*80)
+        logger.info("PEAK-BASED SEGMENTATION COMPLETED")
+        logger.info("="*80)
+        logger.info(f"Initial segments: {results['initial_segment_count']}")
+        logger.info(f"Final segments: {results['final_segment_count']}")
+        logger.info(f"Output directory: {output_dir}")
+        logger.info("="*80 + "\n")
+        
+        return results
+    
     def handle_full_video_analysis(self, video_path, peak_frames=None, cluster_assignments=None, num_workers=4, existing_pose_data=None, 
                                    perform_segmentation=True, segmentation_window_size=10, segmentation_num_regimes=None, segmentation_min_segment_length=5):
         """
@@ -1559,6 +4079,8 @@ class VideoAnalysisBackend:
         2. Pose estimation on entire video (runs in parallel with eventfulness)
         3. Wait for eventfulness to complete, then load data and extract peak frames
         4. Run clustering and similarity calculation
+        5. Run pose-based segmentation from peak to peak
+        6. Run peak-based segmentation with iterative merging (NEW)
         
         Args:
             video_path: Path to the video file
@@ -1572,6 +4094,9 @@ class VideoAnalysisBackend:
             - centroids: Dictionary of cluster centroids
             - similarities: Dictionary of cosine similarities
             - cluster_assignments: Dictionary of cluster assignments
+            - fluss_segmentation: Dictionary of FLUSS segmentation results
+            - pose_segmentation_results: Dictionary of pose-based segmentation results
+            - peak_segmentation: Dictionary of peak-based segmentation with merging (NEW)
         """
         import subprocess
         import time
@@ -1811,6 +4336,7 @@ class VideoAnalysisBackend:
             similarities = None
             cluster_assignments = None
             dtw_segmentation = None
+            peak_segmentation = None
             
             if peak_frames:
                 logger.info("Step 4/5: Performing clustering on peak frames...")
@@ -1844,17 +4370,136 @@ class VideoAnalysisBackend:
                               f"{num_segments} global segments")
                 else:
                     logger.warning("No FLUSS segmentation results")
+                
+                # Create cosine similarity visualization by cluster
+                if similarities and centroids:
+                    logger.info("Creating cosine similarity plots by cluster...")
+                    video_name = os.path.basename(video_path).replace('.mp4', '').replace('.', '_')
+                    output_dir = os.path.join(RESULTS_DIR, video_name)
+                    try:
+                        plot_path = self.plot_cosine_similarities_by_cluster(
+                            similarities, 
+                            cluster_assignments=cluster_assignments,
+                            peak_frames=peak_frames,
+                            output_dir=output_dir,
+                            video_name=video_name,
+                            show_raw=True
+                        )
+                        if plot_path:
+                            logger.info(f"Cosine similarity plot saved to: {plot_path}")
+                    except Exception as e:
+                        logger.error(f"Error creating cosine similarity plot: {str(e)}")
+                        import traceback
+                        logger.error(traceback.format_exc())
+                
+                # NEW: Perform peak-based segmentation
+                logger.info("Performing peak-based segmentation with iterative merging...")
+                peak_segmentation = None
+                if similarities and peak_frames:
+                    try:
+                        peak_segmentation = self.handle_peak_based_segmentation(
+                            similarities=similarities,
+                            peak_frames=peak_frames,
+                            similarity_threshold=0.8,
+                            max_passes=10,
+                            comparison_method='mean_cosine',
+                            create_visualizations=True,
+                            output_dir=output_dir,
+                            video_name=video_name
+                        )
+                        
+                        if peak_segmentation:
+                            logger.info(f"Peak-based segmentation completed: "
+                                      f"{peak_segmentation['initial_segment_count']} → "
+                                      f"{peak_segmentation['final_segment_count']} segments")
+                    except Exception as e:
+                        logger.error(f"Error in peak-based segmentation: {str(e)}")
+                        import traceback
+                        logger.error(traceback.format_exc())
+                
+                # Step 5: Run pose-based segmentation (NEW)
+                logger.info("Step 5/5: Running pose-based segmentation from peak to peak...")
+                pose_segmentation_results = None
+                
+                if peak_frames and pose_data:
+                    try:
+                        pose_segmentation_results = self.handle_pose_segmentation(
+                            peak_frames=peak_frames,
+                            pose_data=pose_data,
+                            video_info=video_info,
+                            video_path=video_path,
+                            comparison_method='dtw',  # Use all comparison methods
+                            threshold_strategy='adaptive',  # Use adaptive thresholding
+                            recursive_strategies=['merge_similar'],
+                            output_formats=['boundaries', 'labels', 'change_points'],
+                            create_visualizations=True
+                        )
+                        
+                        if pose_segmentation_results:
+                            logger.info(f"Pose segmentation completed successfully")
+                            logger.info(f"Results saved to: {pose_segmentation_results.get('json_path', 'N/A')}")
+                        else:
+                            logger.warning("Pose segmentation returned no results")
+                    except Exception as e:
+                        logger.error(f"Error in pose segmentation: {str(e)}")
+                        import traceback
+                        logger.error(traceback.format_exc())
+                else:
+                    logger.info("Skipping pose segmentation - missing peak_frames or pose_data")
             else:
-                logger.info("Skipping clustering step - no peak frames available")
+                logger.info("Skipping clustering and pose segmentation - no peak frames available")
+                pose_segmentation_results = None
             
             logger.info("Complete analysis workflow finished")
-            return pose_data, eventfulness_data_dict, peak_frames, centroids, similarities, cluster_assignments, fluss_segmentation
+            return pose_data, eventfulness_data_dict, peak_frames, centroids, similarities, cluster_assignments, fluss_segmentation, pose_segmentation_results, peak_segmentation
             
         except Exception as e:
             logger.error(f"Error in complete analysis workflow: {str(e)}")
             import traceback
             logger.error(traceback.format_exc())
-            return None, None, None, None, None, None, None
+            return None, None, None, None, None, None, None, None, None
+
+# Example usage for pose-based segmentation
+# 
+# The new pose segmentation system segments video from peak to peak based on eventfulness data,
+# then compares segments using multiple methods and recursively refines them.
+#
+# Usage Example 1: Run complete analysis with pose segmentation
+# backend = VideoAnalysisBackend()
+# results = backend.run_complete_analysis("/path/to/video.mp4", num_workers=4)
+# pose_data, eventfulness_data, peak_frames, centroids, similarities, clusters, fluss_seg, pose_seg = results
+#
+# Usage Example 2: Run pose segmentation separately
+# backend = VideoAnalysisBackend()
+# pose_seg_results = backend.handle_pose_segmentation(
+#     peak_frames=peak_frames,
+#     pose_data=pose_data,
+#     video_info=video_info,
+#     video_path=video_path,
+#     comparison_method='cosine',  # or 'dtw', 'statistical', 'frechet', 'all'
+#     threshold_strategy='adaptive',  # or 'fixed', 'clustering', 'statistical_test'
+#     recursive_strategies=['merge_similar'],
+#     similarity_threshold=0.7,  # used if threshold_strategy='fixed'
+#     output_formats=['boundaries', 'labels', 'change_points'],
+#     create_visualizations=True
+# )
+#
+# The results include:
+# - initial_segments: Segments created from peak to peak
+# - similarity_matrix: Pairwise similarity scores between segments
+# - refined_segments: Segments after recursive refinement (per strategy)
+# - output_formats: Various output formats (boundaries, labels, etc.)
+# - visualizations: Paths to generated visualization files
+#
+# Visualization files created:
+# - segmentation_timeline: Timeline showing all segments
+# - similarity_matrix: Heatmap of segment similarities
+# - threshold_analysis: How the threshold was determined
+# - segment_statistics: Statistical analysis of segments
+# - pose_changes: Frames with significant pose changes
+# - merge_history: Step-by-step merge operations
+# - segment_N_creation: Individual segment creation analysis
+# - segment_comparisons: Side-by-side trajectory comparisons
 
 # Example usage (commented out - use run_complete_analysis method instead)
 # if __name__ == "__main__":
