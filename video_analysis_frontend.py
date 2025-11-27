@@ -430,8 +430,7 @@ app.layout = html.Div([
     dcc.Store(id='cluster-centroids', data=None),
     dcc.Store(id='cosine-similarity-data', data=None),
     dcc.Store(id='full-video-pose-data', data=None),
-    dcc.Store(id='fluss-segmentation-data', data=None),
-    dcc.Store(id='motif-visualization-data', data=None),
+    dcc.Store(id='dtw-segmentation-data', data=None),
     
     # Main container
     html.Div([
@@ -517,24 +516,16 @@ app.layout = html.Div([
                     ),
                 ], className='section-card', id='cosine-similarity-section', style={'display': 'none'}),
                 
-                # Motif visualization section
+                # DTW segmentation section
                 html.Div([
-                    html.H3("mSTUMP Motif Analysis", style={'fontSize': '16px', 'fontWeight': '600', 'color': '#202123', 'marginBottom': '8px'}),
-                    html.Div("Repeated patterns (motifs) identified by multivariate matrix profile analysis", 
-                            style={'fontSize': '13px', 'color': '#8e8ea0', 'marginBottom': '12px'}),
-                    html.Div(id='motif-images-container', style={'display': 'flex', 'flexDirection': 'column', 'gap': '16px'}),
-                ], className='section-card', id='motif-section', style={'display': 'none'}),
-                
-                # FLUSS segmentation section
-                html.Div([
-                    html.H3("FLUSS-Based Time Series Segmentation", style={'fontSize': '16px', 'fontWeight': '600', 'color': '#202123', 'marginBottom': '8px'}),
-                    html.Div(id='fluss-segmentation-info', style={'fontSize': '13px', 'color': '#8e8ea0', 'marginBottom': '12px'}),
+                    html.H3("DTW-Based Time Series Segmentation", style={'fontSize': '16px', 'fontWeight': '600', 'color': '#202123', 'marginBottom': '8px'}),
+                    html.Div(id='dtw-segmentation-info', style={'fontSize': '13px', 'color': '#8e8ea0', 'marginBottom': '12px'}),
                     dcc.Graph(
-                        id='fluss-segmentation-graph',
+                        id='dtw-segmentation-graph',
                         style={'height': '400px', 'width': '100%'},
                         config={'displayModeBar': False, 'displaylogo': False}
                     ),
-                ], className='section-card', id='fluss-segmentation-section', style={'display': 'none'}),
+                ], className='section-card', id='dtw-segmentation-section', style={'display': 'none'}),
                 
             ], className='content-area'),
         ], className='main-layout'),
@@ -599,8 +590,6 @@ def update_video_list(current_video):
      Output('cosine-similarity-data', 'data', allow_duplicate=True),
      Output('cluster-centroids', 'data', allow_duplicate=True),
      Output('full-video-pose-data', 'data', allow_duplicate=True),
-     Output('fluss-segmentation-data', 'data', allow_duplicate=True),
-     Output('motif-visualization-data', 'data', allow_duplicate=True),
      Output('analysis-status', 'children', allow_duplicate=True)],
     Input({'type': 'video-button', 'path': dash.ALL}, 'n_clicks'),
     State({'type': 'video-button', 'path': dash.ALL}, 'id'),
@@ -612,12 +601,12 @@ def select_video(n_clicks, ids, current_video):
     # Use callback context to find which button was clicked
     ctx = dash.callback_context
     if not ctx.triggered:
-        return dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update
+        return dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update
     
     # Find the index of the clicked button
     triggered_prop = ctx.triggered[0]['prop_id']
     if not triggered_prop or '.n_clicks' not in triggered_prop:
-        return dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update
+        return dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update
     
     # Find which button was clicked by checking which n_clicks changed
     clicked_index = None
@@ -627,25 +616,25 @@ def select_video(n_clicks, ids, current_video):
             break
     
     if clicked_index is None or clicked_index >= len(ids):
-        return dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update
+        return dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update
     
     # Get the video path from the clicked button
     video_path = ids[clicked_index]['path']
     
     # If clicking the same video, don't reload
     if video_path == current_video:
-        return dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update
+        return dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update
     
     # Validate video path exists
     if not video_path or not os.path.exists(video_path):
         logger.error(f"Video file not found: {video_path}")
-        return dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update
+        return dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update
     
     # Get video info
     video_info = backend.get_video_info(video_path)
     if not video_info:
         logger.error(f"Failed to get video info for: {video_path}")
-        return video_path, None, None, None, None, None, None, None, None, None, ""
+        return video_path, None, None, None, None, None, None, None, ""
     
     # Find matching config and eventfulness data
     config_path, config = backend.find_matching_config(video_path)
@@ -663,7 +652,7 @@ def select_video(n_clicks, ids, current_video):
     logger.info(f"Switching to video: {video_path}")
     
     # Return new video data and clear all analysis data from previous video
-    return video_path, video_info, eventfulness_data, None, None, None, None, None, None, None, ""
+    return video_path, video_info, eventfulness_data, None, None, None, None, None, ""
 
 # Callback to update video info display
 @callback(
@@ -684,8 +673,7 @@ def update_video_info_display(video_path, video_info, eventfulness_data):
      Output('video-info-minimal', 'children'),
      Output('analysis-control-section', 'style'),
      Output('peak-frames-section', 'style', allow_duplicate=True),
-     Output('cosine-similarity-section', 'style', allow_duplicate=True),
-     Output('motif-section', 'style', allow_duplicate=True)],
+     Output('cosine-similarity-section', 'style', allow_duplicate=True)],
     [Input('current-video', 'data'),
      Input('video-info', 'data')],
     prevent_initial_call='initial_duplicate'
@@ -693,11 +681,11 @@ def update_video_info_display(video_path, video_info, eventfulness_data):
 def update_video_player(video_path, video_info):
     """Update video player and reset analysis sections when video changes."""
     if not video_path or not video_info:
-        return '', {'display': 'none'}, '', {'display': 'none'}, {'display': 'none'}, {'display': 'none'}, {'display': 'none'}
+        return '', {'display': 'none'}, '', {'display': 'none'}, {'display': 'none'}, {'display': 'none'}
     
     if not os.path.exists(video_path):
         logger.warning(f"Video file does not exist: {video_path}")
-        return '', {'display': 'none'}, '', {'display': 'none'}, {'display': 'none'}, {'display': 'none'}, {'display': 'none'}
+        return '', {'display': 'none'}, '', {'display': 'none'}, {'display': 'none'}, {'display': 'none'}
     
     # Create a data URL for the video
     video_url = f"/video?path={base64.b64encode(video_path.encode()).decode()}"
@@ -708,7 +696,7 @@ def update_video_player(video_path, video_info):
     
     # Show analysis control section and video section when video is loaded
     # Hide analysis sections when switching videos (graph-section is controlled by eventfulness callback)
-    return video_url, {'display': 'flex'}, info_text, {'display': 'block'}, {'display': 'none'}, {'display': 'none'}, {'display': 'none'}
+    return video_url, {'display': 'flex'}, info_text, {'display': 'block'}, {'display': 'none'}, {'display': 'none'}
 
 # Callback to update eventfulness graph
 @callback(
@@ -901,14 +889,12 @@ def handle_video_playback(playing):
      Output('cluster-centroids', 'data', allow_duplicate=True),
      Output('cosine-similarity-data', 'data', allow_duplicate=True),
      Output('full-video-pose-data', 'data', allow_duplicate=True),
-     Output('fluss-segmentation-data', 'data', allow_duplicate=True),
-     Output('motif-visualization-data', 'data', allow_duplicate=True),
+     Output('dtw-segmentation-data', 'data', allow_duplicate=True),
      Output('analysis-status', 'children'),
      Output('graph-section', 'style', allow_duplicate=True),
      Output('peak-frames-section', 'style', allow_duplicate=True),
      Output('cosine-similarity-section', 'style', allow_duplicate=True),
-     Output('motif-section', 'style', allow_duplicate=True),
-     Output('fluss-segmentation-section', 'style', allow_duplicate=True)],
+     Output('dtw-segmentation-section', 'style', allow_duplicate=True)],
     [Input('complete-analysis-btn', 'n_clicks')],
     [State('current-video', 'data'),
      State('video-info', 'data'),
@@ -918,7 +904,7 @@ def handle_video_playback(playing):
 def run_complete_analysis(n_clicks, video_path, video_info, delete_config):
     """Run the complete analysis workflow from start to finish."""
     if not n_clicks or not video_path or not video_info:
-        return dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, "", {'display': 'none'}, {'display': 'none'}, {'display': 'none'}, {'display': 'none'}, {'display': 'none'}
+        return dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, "", {'display': 'none'}, {'display': 'none'}, {'display': 'none'}, {'display': 'none'}
     
     logger.info(f"Starting complete analysis for: {video_path}")
     
@@ -936,8 +922,8 @@ def run_complete_analysis(n_clicks, video_path, video_info, delete_config):
         # Update status
         status_msg = html.Div("Starting complete analysis... This may take several minutes.", style={'color': '#10a37f'})
         
-        # Run the complete analysis workflow (FLUSS segmentation enabled)
-        pose_data, eventfulness_data, peak_frames, centroids, similarities, cluster_assignments, fluss_segmentation = backend.run_complete_analysis(
+        # Run the complete analysis workflow
+        pose_data, eventfulness_data, peak_frames, centroids, similarities, cluster_assignments, dtw_segmentation = backend.run_complete_analysis(
             video_path, num_workers=4)
         
         # Update status based on results
@@ -945,42 +931,29 @@ def run_complete_analysis(n_clicks, video_path, video_info, delete_config):
             status_msg = html.Div([
                 html.Div(f"✓ Analysis complete! Processed {len(pose_data)} frames, found {len(peak_frames)} peaks.", style={'color': '#10a37f', 'marginBottom': '4px'}),
                 html.Div(f"✓ Created {len(cluster_assignments) if cluster_assignments else 0} cluster assignments." if cluster_assignments else "⚠ No cluster assignments created.", style={'color': '#10a37f' if cluster_assignments else '#fbd38d'}),
-                html.Div(f"✓ FLUSS segmentation: {fluss_segmentation['num_clusters']} clusters, {len(fluss_segmentation['segments'])} segments." if fluss_segmentation else "⚠ No FLUSS segmentation.", style={'color': '#10a37f' if fluss_segmentation else '#fbd38d', 'marginTop': '4px'}),
+                html.Div(f"✓ DTW segmentation: {dtw_segmentation['num_clusters']} clusters segmented." if dtw_segmentation else "⚠ No DTW segmentation.", style={'color': '#10a37f' if dtw_segmentation else '#fbd38d', 'marginTop': '4px'}),
             ])
         elif pose_data:
             status_msg = html.Div("⚠ Analysis partially complete. Pose estimation finished, but eventfulness data or peaks not found.", style={'color': '#fbd38d'})
         else:
             status_msg = html.Div("✗ Analysis failed. Check logs for details.", style={'color': '#ef4444'})
         
-        # Check for motif visualization files
-        motif_viz_data = None
-        motif_viz_path = os.path.join(RESULTS_DIR, 'mstump_motifs.png')
-        motif_summary_path = os.path.join(RESULTS_DIR, 'mstump_motifs_summary.png')
-        
-        if os.path.exists(motif_viz_path) and os.path.exists(motif_summary_path):
-            motif_viz_data = {
-                'motif_viz_path': motif_viz_path,
-                'motif_summary_path': motif_summary_path,
-                'timestamp': os.path.getmtime(motif_viz_path)
-            }
-        
         # Determine which sections to show
         graph_style = {'display': 'block'} if eventfulness_data else {'display': 'none'}
         peak_style = {'display': 'block'} if peak_frames else {'display': 'none'}
         similarity_style = {'display': 'block'} if similarities and centroids else {'display': 'none'}
-        motif_style = {'display': 'block'} if motif_viz_data else {'display': 'none'}
-        fluss_style = {'display': 'block'} if fluss_segmentation else {'display': 'none'}
+        dtw_style = {'display': 'block'} if dtw_segmentation else {'display': 'none'}
         
-        logger.info(f"Complete analysis finished. Results: pose_data={bool(pose_data)}, eventfulness={bool(eventfulness_data)}, peaks={len(peak_frames) if peak_frames else 0}, clusters={len(cluster_assignments) if cluster_assignments else 0}, fluss={bool(fluss_segmentation)}, motifs={bool(motif_viz_data)}")
+        logger.info(f"Complete analysis finished. Results: pose_data={bool(pose_data)}, eventfulness={bool(eventfulness_data)}, peaks={len(peak_frames) if peak_frames else 0}, clusters={len(cluster_assignments) if cluster_assignments else 0}, dtw={bool(dtw_segmentation)}")
         
-        return eventfulness_data, peak_frames, cluster_assignments, centroids, similarities, pose_data, fluss_segmentation, motif_viz_data, status_msg, graph_style, peak_style, similarity_style, motif_style, fluss_style
+        return eventfulness_data, peak_frames, cluster_assignments, centroids, similarities, pose_data, dtw_segmentation, status_msg, graph_style, peak_style, similarity_style, dtw_style
         
     except Exception as e:
         logger.error(f"Error in complete analysis: {str(e)}")
         import traceback
         logger.error(traceback.format_exc())
         status_msg = html.Div(f"✗ Error during analysis: {str(e)}", style={'color': '#ef4444'})
-        return None, None, None, None, None, None, None, None, status_msg, {'display': 'none'}, {'display': 'none'}, {'display': 'none'}, {'display': 'none'}, {'display': 'none'}
+        return None, None, None, None, None, None, None, status_msg, {'display': 'none'}, {'display': 'none'}, {'display': 'none'}, {'display': 'none'}
 
 # Callback to update peak frames gallery
 @callback(
@@ -1181,75 +1154,18 @@ def create_cosine_similarity_graph(similarities, centroids):
     
     return fig, {'display': 'block'}
 
-# Callback to display motif visualizations
+# Callback to visualize DTW segmentation results
 @callback(
-    [Output('motif-images-container', 'children'),
-     Output('motif-section', 'style')],
-    Input('motif-visualization-data', 'data')
-)
-def display_motif_visualizations(motif_data):
-    """Display the motif visualization images."""
-    if not motif_data:
-        return html.Div(), {'display': 'none'}
-    
-    motif_viz_path = motif_data.get('motif_viz_path')
-    motif_summary_path = motif_data.get('motif_summary_path')
-    
-    if not motif_viz_path or not motif_summary_path:
-        return html.Div(), {'display': 'none'}
-    
-    # Check if files exist
-    if not os.path.exists(motif_viz_path) or not os.path.exists(motif_summary_path):
-        return html.Div("Motif visualization files not found.", 
-                       style={'color': '#ef4444', 'textAlign': 'center', 'padding': '20px'}), {'display': 'block'}
-    
-    # Create relative paths for serving
-    rel_motif_path = os.path.relpath(motif_viz_path, RESULTS_DIR)
-    rel_summary_path = os.path.relpath(motif_summary_path, RESULTS_DIR)
-    
-    # Create image URLs
-    motif_url = f"/frame/{rel_motif_path}"
-    summary_url = f"/frame/{rel_summary_path}"
-    
-    # Create the image display elements
-    content = html.Div([
-        # Detailed motif comparison
-        html.Div([
-            html.H4("Detailed Motif Comparison", 
-                   style={'fontSize': '14px', 'fontWeight': '600', 'color': '#202123', 'marginBottom': '8px'}),
-            html.Div("Shows the top repeated patterns with their matching pairs across all dimensions", 
-                    style={'fontSize': '12px', 'color': '#8e8ea0', 'marginBottom': '12px'}),
-            html.Img(src=motif_url, 
-                    style={'width': '100%', 'height': 'auto', 'border': '1px solid #e5e5e5', 
-                           'borderRadius': '6px', 'boxShadow': '0 2px 4px rgba(0,0,0,0.05)'})
-        ], style={'marginBottom': '24px'}),
-        
-        # Summary view
-        html.Div([
-            html.H4("Motif Locations in Time Series", 
-                   style={'fontSize': '14px', 'fontWeight': '600', 'color': '#202123', 'marginBottom': '8px'}),
-            html.Div("Shows where each motif occurs in the full time series (matching pairs have the same color)", 
-                    style={'fontSize': '12px', 'color': '#8e8ea0', 'marginBottom': '12px'}),
-            html.Img(src=summary_url, 
-                    style={'width': '100%', 'height': 'auto', 'border': '1px solid #e5e5e5', 
-                           'borderRadius': '6px', 'boxShadow': '0 2px 4px rgba(0,0,0,0.05)'})
-        ])
-    ])
-    
-    return content, {'display': 'block'}
-
-# Callback to visualize FLUSS segmentation results
-@callback(
-    [Output('fluss-segmentation-graph', 'figure'),
-     Output('fluss-segmentation-info', 'children'),
-     Output('fluss-segmentation-section', 'style')],
-    [Input('fluss-segmentation-data', 'data'),
+    [Output('dtw-segmentation-graph', 'figure'),
+     Output('dtw-segmentation-info', 'children'),
+     Output('dtw-segmentation-section', 'style')],
+    [Input('dtw-segmentation-data', 'data'),
      Input('cosine-similarity-data', 'data'),
      Input('cluster-centroids', 'data')]
 )
-def visualize_fluss_segmentation(fluss_data, similarities, centroids):
-    """Create visualization of FLUSS segmentation results with GLOBAL segments across all clusters."""
-    if not fluss_data or not similarities or not centroids:
+def visualize_dtw_segmentation(dtw_data, similarities, centroids):
+    """Create visualization of DTW segmentation results with GLOBAL segments across all clusters."""
+    if not dtw_data or not similarities or not centroids:
         return dash.no_update, "", {'display': 'none'}
     
     # Extract frame numbers and times from similarities
@@ -1270,31 +1186,21 @@ def visualize_fluss_segmentation(fluss_data, similarities, centroids):
         '#353740', '#6b7280', '#9ca3af', '#d1d5db', '#e5e7eb'
     ]
     
-    # Create figure with subplots for each cluster + arc curve
+    # Create figure with subplots for each cluster
     from plotly.subplots import make_subplots
     
     num_clusters = len(centroids)
-    arc_curve = fluss_data.get('arc_curve', None)
-    
-    # Add extra row for arc curve if available
-    total_rows = num_clusters + (1 if arc_curve else 0)
-    
-    # Create subplot titles
-    subplot_titles = [f'Cluster {cid}' for cid in sorted(centroids.keys())]
-    if arc_curve:
-        subplot_titles.append('FLUSS Arc Curve (CAC)')
-    
     fig = make_subplots(
-        rows=total_rows, 
+        rows=num_clusters, 
         cols=1,
-        subplot_titles=subplot_titles,
-        vertical_spacing=0.08 if not arc_curve else 0.06,
+        subplot_titles=[f'Cluster {cid}' for cid in sorted(centroids.keys())],
+        vertical_spacing=0.08,
         shared_xaxes=True
     )
     
     # Get GLOBAL change points and segments (not per-cluster)
-    change_points = fluss_data.get('change_points', [])
-    segments = fluss_data.get('segments', [])
+    change_points = dtw_data.get('change_points', [])
+    segments = dtw_data.get('segments', [])
     
     # Plot each cluster's similarity with GLOBAL segment boundaries
     for i, cluster_id in enumerate(sorted(centroids.keys())):
@@ -1348,57 +1254,9 @@ def visualize_fluss_segmentation(fluss_data, similarities, centroids):
                     row=row, col=1
                 )
     
-    # Add FLUSS Arc Curve if available
-    if arc_curve:
-        arc_row = num_clusters + 1
-        
-        # The arc curve shows the likelihood of regime changes
-        # Peaks in the arc curve correspond to change points
-        fig.add_trace(
-            go.Scatter(
-                x=list(range(len(arc_curve))),
-                y=arc_curve,
-                mode='lines',
-                name='Arc Curve',
-                line=dict(color='#ef4444', width=2),
-                fill='tozeroy',
-                fillcolor='rgba(239, 68, 68, 0.1)',
-                showlegend=False,
-                hovertemplate='<b>Arc Curve</b><br>Index: %{x}<br>Value: %{y:.3f}<extra></extra>'
-            ),
-            row=arc_row, col=1
-        )
-        
-        # Mark detected change points on the arc curve
-        for cp_idx in change_points[1:-1]:  # Skip first and last
-            if cp_idx < len(arc_curve):
-                fig.add_trace(
-                    go.Scatter(
-                        x=[cp_idx],
-                        y=[arc_curve[cp_idx]],
-                        mode='markers',
-                        marker=dict(color='#ef4444', size=10, symbol='diamond', 
-                                  line=dict(width=2, color='white')),
-                        showlegend=False,
-                        hovertemplate=f'<b>Change Point</b><br>Index: {cp_idx}<br>Arc Value: {arc_curve[cp_idx]:.3f}<extra></extra>'
-                    ),
-                    row=arc_row, col=1
-                )
-        
-        # Update y-axis for arc curve
-        fig.update_yaxes(
-            title_text='Arc Curve Value',
-            titlefont=dict(size=11, color='#8e8ea0'),
-            tickfont=dict(size=10, color='#8e8ea0'),
-            gridcolor='#f0f0f0',
-            zeroline=False,
-            showline=False,
-            row=arc_row, col=1
-        )
-    
     # Update layout
     fig.update_layout(
-        height=150 * total_rows + 100,
+        height=150 * num_clusters + 100,
         showlegend=False,
         margin=dict(l=50, r=30, t=50, b=40),
         hovermode='closest',
@@ -1409,13 +1267,13 @@ def visualize_fluss_segmentation(fluss_data, similarities, centroids):
     
     # Update axes
     fig.update_xaxes(
-        title_text='Index' if arc_curve else 'Frame Number',
+        title_text='Frame Number',
         titlefont=dict(size=13, color='#8e8ea0'),
         tickfont=dict(size=12, color='#8e8ea0'),
         gridcolor='#f0f0f0',
         zeroline=False,
         showline=False,
-        row=total_rows, col=1
+        row=num_clusters, col=1
     )
     
     for i in range(1, num_clusters + 1):
@@ -1431,12 +1289,12 @@ def visualize_fluss_segmentation(fluss_data, similarities, centroids):
     
     # Create info text
     total_segments = len(segments)
-    params = fluss_data['parameters']
+    params = dtw_data['parameters']
     info_text = html.Div([
-        html.Span(f"Method: FLUSS (Matrix Profile) | ", style={'marginRight': '8px', 'fontWeight': '600'}),
+        html.Span(f"Method: Vector-based DTW | ", style={'marginRight': '8px', 'fontWeight': '600'}),
         html.Span(f"Global Segments: {total_segments} | ", style={'marginRight': '8px'}),
         html.Span(f"Window: {params['window_size']} | ", style={'marginRight': '8px'}),
-        html.Span(f"Regimes: {params.get('num_regimes', 'auto')} | ", style={'marginRight': '8px'}),
+        html.Span(f"Threshold: {params['threshold']} | ", style={'marginRight': '8px'}),
         html.Span(f"Min Length: {params['min_segment_length']} | ", style={'marginRight': '8px'}),
         html.Span(f"Dimensions: {params.get('vector_dimensions', 'N/A')}", style={'marginRight': '8px'}),
     ])

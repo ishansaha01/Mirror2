@@ -12,8 +12,6 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import silhouette_score
 from sklearn.metrics.pairwise import cosine_similarity
 import mediapipe as mp
-import matplotlib.pyplot as plt
-import matplotlib.patches as patches
 
 # Set up logging
 log_file = "/home/is1893/Mirror2/video_analysis.log"
@@ -25,14 +23,20 @@ logging.basicConfig(
 )
 logger = logging.getLogger('video_analysis')
 
-# Segmentation library imports - using STUMPY for FLUSS segmentation
+# DTW imports - try dtaidistance first, fallback to scipy
 try:
-    import stumpy
-    SEGMENTATION_LIBRARY = 'stumpy'
-    logger.info("Using STUMPY library for FLUSS-based segmentation")
+    from dtaidistance import dtw
+    DTW_LIBRARY = 'dtaidistance'
+    logger.info("Using dtaidistance library for DTW computations")
 except ImportError:
-    SEGMENTATION_LIBRARY = None
-    logger.warning("STUMPY not available. Time series segmentation will not be available.")
+    try:
+        from scipy.spatial.distance import euclidean
+        from scipy.ndimage import uniform_filter1d
+        DTW_LIBRARY = 'scipy'
+        logger.info("dtaidistance not available, using scipy for DTW computations")
+    except ImportError:
+        DTW_LIBRARY = None
+        logger.warning("No DTW library available. DTW segmentation will not be available.")
 
 # Define constants
 RESULTS_DIR = "/home/is1893/Mirror2/dataSets/test_data/results"
@@ -922,283 +926,247 @@ class VideoAnalysisBackend:
         logger.info(f"Applied moving average smoothing with window size {window_size} to {len(sorted_frames)} frames")
         return smoothed_similarities
     
-    def detect_fluss_change_points(self, time_series, window_size=10, num_regimes=None, exclusion_zone=None):
+    def compute_dtw_distance(self, series1, series2, window=None):
         """
-        Detects change points in a univariate time series using STUMPY's FLUSS algorithm.
+        Computes Dynamic Time Warping (DTW) distance between two time series.
         
-        FLUSS (Fast Low-cost Unipotent Semantic Segmentation) uses matrix profiles to find
-        regime changes in time series data.
+        Args:
+            series1: First time series (numpy array or list)
+            series2: Second time series (numpy array or list)
+            window: Sakoe-Chiba window constraint (optional)
+            
+        Returns:
+            DTW distance (normalized by series length)
+        """
+        if DTW_LIBRARY is None:
+            logger.error("No DTW library available. Cannot compute DTW distance.")
+            return float('inf')
+        
+        series1 = np.array(series1)
+        series2 = np.array(series2)
+        
+        if DTW_LIBRARY == 'dtaidistance':
+            # Use dtaidistance library for efficient DTW
+            try:
+                if window is not None:
+                    distance = dtw.distance(series1, series2, window=window)
+                else:
+                    distance = dtw.distance(series1, series2)
+                # Normalize by average length
+                normalized_distance = distance / ((len(series1) + len(series2)) / 2)
+                return normalized_distance
+            except Exception as e:
+                logger.error(f"Error computing DTW with dtaidistance: {str(e)}")
+                return float('inf')
+        
+        elif DTW_LIBRARY == 'scipy':
+            # Fallback: implement basic DTW using dynamic programming
+            n, m = len(series1), len(series2)
+            
+            # Initialize DTW matrix
+            dtw_matrix = np.full((n + 1, m + 1), float('inf'))
+            dtw_matrix[0, 0] = 0
+            
+            # Apply window constraint if specified
+            if window is None:
+                window = max(n, m)
+            
+            # Fill DTW matrix
+            for i in range(1, n + 1):
+                for j in range(max(1, i - window), min(m + 1, i + window + 1)):
+                    cost = abs(series1[i-1] - series2[j-1])
+                    dtw_matrix[i, j] = cost + min(
+                        dtw_matrix[i-1, j],      # insertion
+                        dtw_matrix[i, j-1],      # deletion
+                        dtw_matrix[i-1, j-1]     # match
+                    )
+            
+            # Normalize by path length (average of both series lengths)
+            normalized_distance = dtw_matrix[n, m] / ((n + m) / 2)
+            return normalized_distance
+        
+        return float('inf')
+    
+    def detect_dtw_change_points(self, time_series, window_size=10, threshold=1.5, min_segment_length=5):
+        """
+        Detects change points in a univariate time series using DTW distance between sliding windows.
         
         Args:
             time_series: 1D numpy array or list of time series values
-            window_size: Subsequence window size for matrix profile computation
-            num_regimes: Number of regimes to segment into (if None, auto-detect)
-            exclusion_zone: Exclusion zone for matrix profile (if None, uses m//4)
+            window_size: Size of the sliding window for comparison
+            threshold: Threshold multiplier for detecting change points (relative to median DTW)
+            min_segment_length: Minimum number of frames between change points
             
         Returns:
             List of change point indices
         """
-        if SEGMENTATION_LIBRARY is None:
-            logger.warning("STUMPY library not available. Returning simple segmentation.")
+        if DTW_LIBRARY is None:
+            logger.warning("No DTW library available. Returning simple segmentation.")
             return [0, len(time_series)]
         
-        time_series = np.array(time_series, dtype=np.float64)
+        time_series = np.array(time_series)
         n = len(time_series)
         
-        # Need sufficient data points for FLUSS
+        # Need at least 2*window_size points for meaningful comparison
         if n < 2 * window_size:
             logger.warning(f"Time series too short ({n} points) for window size {window_size}")
             return [0, n]
         
-        try:
-            # Compute matrix profile
-            logger.info(f"Computing matrix profile for time series of length {n} with window size {window_size}")
-            mp = stumpy.stump(time_series, m=window_size)
+        # Compute DTW distances between consecutive windows
+        dtw_distances = []
+        positions = []
+        
+        # Slide window and compute DTW between adjacent windows
+        step_size = max(1, window_size // 2)  # 50% overlap
+        
+        for i in range(0, n - 2 * window_size + 1, step_size):
+            window1 = time_series[i:i + window_size]
+            window2 = time_series[i + window_size:i + 2 * window_size]
             
-            # Compute arc curve (corrected arc curve) for FLUSS
-            logger.info("Computing FLUSS arc curve for regime change detection")
-            cac, regime_locations = stumpy.fluss(mp[:, 1], L=window_size, n_regimes=num_regimes, excl_factor=1)
-            
-            # regime_locations contains the indices where regimes change
-            change_points = [0]
-            
-            if regime_locations is not None and len(regime_locations) > 0:
-                # Add detected regime change points
-                for loc in sorted(regime_locations):
-                    if 0 < loc < n:
-                        change_points.append(int(loc))
-            
-            # Always end with the last index
-            if change_points[-1] != n:
-                change_points.append(n)
-            
-            logger.info(f"FLUSS detected {len(change_points) - 1} segments with {len(change_points) - 2} change points")
-            
-            return change_points
-            
-        except Exception as e:
-            logger.error(f"Error in FLUSS segmentation: {str(e)}")
-            import traceback
-            logger.error(traceback.format_exc())
+            # Compute DTW distance between windows
+            distance = self.compute_dtw_distance(window1, window2, window=window_size)
+            dtw_distances.append(distance)
+            positions.append(i + window_size)  # Change point at window boundary
+        
+        if not dtw_distances:
             return [0, n]
+        
+        dtw_distances = np.array(dtw_distances)
+        
+        # Detect peaks in DTW distances (potential change points)
+        # Use threshold relative to median + threshold * std
+        median_dtw = np.median(dtw_distances)
+        std_dtw = np.std(dtw_distances)
+        dtw_threshold = median_dtw + threshold * std_dtw
+        
+        logger.info(f"DTW distances - median: {median_dtw:.4f}, std: {std_dtw:.4f}, threshold: {dtw_threshold:.4f}")
+        
+        # Find change points where DTW distance exceeds threshold
+        change_points = [0]  # Always start with 0
+        
+        for i, (pos, dist) in enumerate(zip(positions, dtw_distances)):
+            if dist > dtw_threshold:
+                # Check if far enough from last change point
+                if pos - change_points[-1] >= min_segment_length:
+                    change_points.append(pos)
+        
+        # Always end with the last index
+        if change_points[-1] != n:
+            change_points.append(n)
+        
+        logger.info(f"Detected {len(change_points) - 1} segments with {len(change_points) - 2} change points")
+        
+        return change_points
     
-    def visualize_motifs(self, mp_distances, mp_indices, T, window_size, vector_time_series, num_motifs=3, output_dir=None):
+    def detect_dtw_change_points_vector(self, vector_time_series, window_size=10, threshold=1.5, min_segment_length=5):
         """
-        Visualizes the top motifs identified by mSTUMP.
+        Detects change points in a MULTIVARIATE time series using DTW distance between sliding windows.
         
-        Args:
-            mp_distances: Matrix profile distances from mSTUMP (n_dims × n_timepoints)
-                Each row is the k-dimensional matrix profile (k=1, 2, ..., n_dims)
-            mp_indices: Matrix profile indices from mSTUMP (n_dims × n_timepoints)
-                Each row contains the indices of nearest neighbors for each k-dimensional profile
-            T: Transposed time series (n_dimensions × n_timepoints)
-            window_size: Window size used for mSTUMP
-            vector_time_series: Original time series (n_timepoints × n_dimensions)
-            num_motifs: Number of top motifs to visualize
-            output_dir: Directory to save visualizations (defaults to RESULTS_DIR)
-        """
-        if output_dir is None:
-            output_dir = RESULTS_DIR
-        
-        os.makedirs(output_dir, exist_ok=True)
-        
-        logger.info(f"Visualizing top {num_motifs} motifs from mSTUMP matrix profile")
-        
-        # Use the full multidimensional matrix profile (last row = all dimensions considered)
-        full_mp_distances = mp_distances[-1]
-        full_mp_indices = mp_indices[-1].astype(int)
-        
-        # Find top motifs (lowest distances = most similar pairs)
-        # Exclude trivial matches (self-matches and overlapping subsequences)
-        valid_motifs = []
-        
-        for i in range(len(full_mp_distances)):
-            if full_mp_distances[i] < np.inf:
-                match_idx = full_mp_indices[i]
-                # Ensure non-trivial match (not overlapping)
-                if abs(i - match_idx) >= window_size:
-                    valid_motifs.append((i, match_idx, full_mp_distances[i]))
-        
-        # Sort by distance (lowest = best motifs)
-        valid_motifs.sort(key=lambda x: x[2])
-        
-        # Take top motifs
-        top_motifs = valid_motifs[:num_motifs]
-        
-        if len(top_motifs) == 0:
-            logger.warning("No valid motifs found")
-            return
-        
-        logger.info(f"Found {len(top_motifs)} motifs to visualize")
-        
-        # Create visualization
-        n_dims = T.shape[0]
-        fig, axes = plt.subplots(num_motifs, n_dims + 1, figsize=(20, 4 * num_motifs))
-        
-        if num_motifs == 1:
-            axes = axes.reshape(1, -1)
-        
-        for motif_idx, (idx1, idx2, distance) in enumerate(top_motifs):
-            # Extract the two matching subsequences
-            subseq1 = vector_time_series[idx1:idx1 + window_size]
-            subseq2 = vector_time_series[idx2:idx2 + window_size]
-            
-            # Plot each dimension
-            for dim in range(n_dims):
-                ax = axes[motif_idx, dim]
-                ax.plot(subseq1[:, dim], label=f'Motif at t={idx1}', linewidth=2, alpha=0.7)
-                ax.plot(subseq2[:, dim], label=f'Match at t={idx2}', linewidth=2, alpha=0.7)
-                ax.set_title(f'Motif {motif_idx + 1} - Dimension {dim + 1}\nDistance: {distance:.4f}')
-                ax.set_xlabel('Time (frames)')
-                ax.set_ylabel('Value')
-                ax.legend()
-                ax.grid(True, alpha=0.3)
-            
-            # Plot matrix profile with motif locations highlighted
-            ax = axes[motif_idx, n_dims]
-            ax.plot(full_mp_distances, linewidth=1, color='gray', alpha=0.5)
-            ax.scatter([idx1, idx2], [full_mp_distances[idx1], full_mp_distances[idx2]], 
-                      color='red', s=100, zorder=5, label='Motif pair')
-            ax.set_title(f'Matrix Profile\nMotif pair at t={idx1} and t={idx2}')
-            ax.set_xlabel('Time (frames)')
-            ax.set_ylabel('Matrix Profile Distance')
-            ax.legend()
-            ax.grid(True, alpha=0.3)
-        
-        plt.tight_layout()
-        
-        # Save figure
-        output_path = os.path.join(output_dir, 'mstump_motifs.png')
-        plt.savefig(output_path, dpi=150, bbox_inches='tight')
-        logger.info(f"Saved motif visualization to {output_path}")
-        
-        # Also create a summary plot showing all motif locations on the time series
-        fig2, axes2 = plt.subplots(n_dims, 1, figsize=(16, 3 * n_dims))
-        
-        if n_dims == 1:
-            axes2 = [axes2]
-        
-        for dim in range(n_dims):
-            ax = axes2[dim]
-            # Plot full time series for this dimension
-            ax.plot(vector_time_series[:, dim], linewidth=1, color='black', alpha=0.5, label='Time series')
-            
-            # Highlight motif locations
-            colors = plt.cm.Set1(np.linspace(0, 1, num_motifs))
-            for motif_idx, (idx1, idx2, distance) in enumerate(top_motifs):
-                # Highlight motif pair regions
-                ax.axvspan(idx1, idx1 + window_size, alpha=0.3, color=colors[motif_idx], 
-                          label=f'Motif {motif_idx + 1} (d={distance:.2f})')
-                ax.axvspan(idx2, idx2 + window_size, alpha=0.3, color=colors[motif_idx])
-            
-            ax.set_title(f'Dimension {dim + 1} - Motif Locations')
-            ax.set_xlabel('Time (frames)')
-            ax.set_ylabel('Value')
-            ax.legend(loc='upper right')
-            ax.grid(True, alpha=0.3)
-        
-        plt.tight_layout()
-        
-        # Save summary figure
-        summary_path = os.path.join(output_dir, 'mstump_motifs_summary.png')
-        plt.savefig(summary_path, dpi=150, bbox_inches='tight')
-        logger.info(f"Saved motif summary to {summary_path}")
-        
-        plt.close('all')
-    
-    def detect_fluss_change_points_multivariate(self, vector_time_series, window_size=10, num_regimes=None, min_segment_length=5, return_arc_curve=False):
-        """
-        Detects change points in a MULTIVARIATE time series using STUMPY's mSTUMP and FLUSS.
-        
-        This treats each time point as a vector (e.g., similarity to all clusters) and finds
-        regime changes across all dimensions simultaneously.
+        This treats each time point as a vector (e.g., similarity to all clusters) and compares
+        windows of vectors using multivariate DTW distance.
         
         Args:
             vector_time_series: 2D numpy array (n_timepoints × n_dimensions)
-            window_size: Subsequence window size for matrix profile computation
-            num_regimes: Number of regimes to segment into (if None, auto-detect)
+            window_size: Size of the sliding window for comparison
+            threshold: Threshold multiplier for detecting change points (relative to median DTW)
             min_segment_length: Minimum number of frames between change points
-            return_arc_curve: If True, returns (change_points, arc_curve) tuple
             
         Returns:
-            List of change point indices, or tuple (change_points, arc_curve) if return_arc_curve=True
+            List of change point indices
         """
-        if SEGMENTATION_LIBRARY is None:
-            logger.warning("STUMPY library not available. Returning simple segmentation.")
+        if DTW_LIBRARY is None:
+            logger.warning("No DTW library available. Returning simple segmentation.")
             return [0, len(vector_time_series)]
         
-        vector_time_series = np.array(vector_time_series, dtype=np.float64)
+        vector_time_series = np.array(vector_time_series)
         n = len(vector_time_series)
         
-        # Need sufficient data points for FLUSS
+        # Need at least 2*window_size points for meaningful comparison
         if n < 2 * window_size:
             logger.warning(f"Time series too short ({n} points) for window size {window_size}")
             return [0, n]
         
-        try:
-            # For multivariate time series, use mSTUMP (multivariate STUMP)
-            logger.info(f"Computing multivariate matrix profile for {n} timepoints × {vector_time_series.shape[1]} dimensions")
+        # Compute DTW distances between consecutive windows of vectors
+        dtw_distances = []
+        positions = []
+        
+        # Slide window and compute DTW between adjacent windows
+        step_size = max(1, window_size // 2)  # 50% overlap
+        
+        for i in range(0, n - 2 * window_size + 1, step_size):
+            window1 = vector_time_series[i:i + window_size]  # Shape: (window_size, n_dims)
+            window2 = vector_time_series[i + window_size:i + 2 * window_size]
             
-            # Transpose for mSTUMP: expects (n_dimensions, n_timepoints)
-            T = vector_time_series.T
-            
-            # Compute multivariate matrix profile
-            # mstump returns (P, I) where P is matrix profile and I is indices
-            # Each row corresponds to k-dimensional matrix profile (k=1, 2, ..., n_dims)
-            mp_distances, mp_indices = stumpy.mstump(T, m=window_size)
-            
-            # Visualize motifs identified by mSTUMP
-            try:
-                self.visualize_motifs(mp_distances, mp_indices, T, window_size, vector_time_series)
-            except Exception as e:
-                logger.warning(f"Could not visualize motifs: {str(e)}")
-                import traceback
-                logger.warning(traceback.format_exc())
-            
-            # Compute FLUSS on the multivariate matrix profile
-            # Use the full multidimensional matrix profile (last row = all dimensions)
-            logger.info("Computing FLUSS arc curve for multivariate regime change detection")
-            
-            # If num_regimes is None, STUMPY will try to auto-detect but may fail
-            # In that case, we still want the arc curve, so we'll catch the error
-            try:
-                cac, regime_locations = stumpy.fluss(mp_distances[-1], L=window_size, n_regimes=num_regimes, excl_factor=1)
-            except (TypeError, ValueError) as e:
-                logger.warning(f"FLUSS regime detection failed: {str(e)}. Computing arc curve only.")
-                # Compute just the arc curve without regime locations
-                cac = stumpy.fluss(mp_distances[-1], L=window_size, n_regimes=1, excl_factor=1)[0]
-                regime_locations = None
-            
-            # regime_locations contains the indices where regimes change
-            change_points = [0]
-            
-            if regime_locations is not None and len(regime_locations) > 0:
-                # Add detected regime change points, filtering by min_segment_length
-                sorted_locs = sorted(regime_locations)
-                for loc in sorted_locs:
-                    if 0 < loc < n and (loc - change_points[-1]) >= min_segment_length:
-                        change_points.append(int(loc))
-            
-            # Always end with the last index
-            if change_points[-1] != n:
-                change_points.append(n)
-            
-            logger.info(f"Multivariate FLUSS detected {len(change_points) - 1} segments with {len(change_points) - 2} change points")
-            
-            if return_arc_curve:
-                return change_points, cac
-            else:
-                return change_points
-            
-        except Exception as e:
-            logger.error(f"Error in multivariate FLUSS segmentation: {str(e)}")
-            import traceback
-            logger.error(traceback.format_exc())
-            if return_arc_curve:
-                return [0, n], None
-            else:
-                return [0, n]
+            # Compute multivariate DTW distance
+            distance = self.compute_multivariate_dtw_distance(window1, window2, window=window_size)
+            dtw_distances.append(distance)
+            positions.append(i + window_size)  # Change point at window boundary
+        
+        if not dtw_distances:
+            return [0, n]
+        
+        dtw_distances = np.array(dtw_distances)
+        
+        # Detect peaks in DTW distances (potential change points)
+        median_dtw = np.median(dtw_distances)
+        std_dtw = np.std(dtw_distances)
+        dtw_threshold = median_dtw + threshold * std_dtw
+        
+        logger.info(f"Vector DTW distances - median: {median_dtw:.4f}, std: {std_dtw:.4f}, threshold: {dtw_threshold:.4f}")
+        
+        # Find change points where DTW distance exceeds threshold
+        change_points = [0]  # Always start with 0
+        
+        for i, (pos, dist) in enumerate(zip(positions, dtw_distances)):
+            if dist > dtw_threshold:
+                # Check if far enough from last change point
+                if pos - change_points[-1] >= min_segment_length:
+                    change_points.append(pos)
+        
+        # Always end with the last index
+        if change_points[-1] != n:
+            change_points.append(n)
+        
+        logger.info(f"Detected {len(change_points) - 1} segments with {len(change_points) - 2} change points")
+        
+        return change_points
     
+    def compute_multivariate_dtw_distance(self, series1, series2, window=None):
+        """
+        Computes DTW distance between two MULTIVARIATE time series.
+        
+        Args:
+            series1: 2D array (n_timepoints1 × n_dimensions)
+            series2: 2D array (n_timepoints2 × n_dimensions)
+            window: Sakoe-Chiba window constraint (optional)
+            
+        Returns:
+            DTW distance (normalized)
+        """
+        if DTW_LIBRARY is None:
+            return float('inf')
+        
+        series1 = np.array(series1)
+        series2 = np.array(series2)
+        
+        # For multivariate DTW, we compute DTW on each dimension and aggregate
+        # This is a common approach: sum or average DTW distances across dimensions
+        
+        if len(series1.shape) == 1:
+            # Univariate case
+            return self.compute_dtw_distance(series1, series2, window)
+        
+        n_dims = series1.shape[1]
+        total_distance = 0.0
+        
+        for dim in range(n_dims):
+            dim_distance = self.compute_dtw_distance(series1[:, dim], series2[:, dim], window)
+            total_distance += dim_distance
+        
+        # Average across dimensions for normalized comparison
+        avg_distance = total_distance / n_dims
+        
+        return avg_distance
     
     def merge_nearby_change_points(self, change_points, min_distance):
         """
@@ -1265,39 +1233,40 @@ class VideoAnalysisBackend:
         
         return segments
     
-    def segment_cosine_similarity_with_fluss(self, similarities, window_size=10, num_regimes=None, min_segment_length=5):
+    def segment_cosine_similarity_with_dtw(self, similarities, window_size=10, threshold=1.5, min_segment_length=5):
         """
-        Segments cosine similarity time series using STUMPY's FLUSS algorithm.
+        Segments cosine similarity time series using DTW-based change point detection.
         
         This method treats the cosine similarities as a MULTIVARIATE time series (vector at each time point)
-        and finds global change points where the overall similarity pattern changes using matrix profiles.
+        and finds global change points where the overall similarity pattern changes, rather than
+        segmenting each cluster independently.
         
         Args:
             similarities: Dictionary mapping frame indices to similarity scores
                          (output from compute_cosine_similarities or smooth_cosine_similarities)
-            window_size: Subsequence window size for matrix profile (default: 10)
-            num_regimes: Number of regimes to segment into (if None, auto-detect)
+            window_size: Size of sliding window for DTW comparison (default: 10)
+            threshold: Threshold multiplier for change detection (default: 1.5)
             min_segment_length: Minimum frames per segment (default: 5)
             
         Returns:
             Dictionary containing segmentation results:
             {
-                'method': 'fluss_matrix_profile',
+                'method': 'dtw_change_detection_vector',
                 'segments': [segment_dicts],  # Global segments
                 'change_points': [indices],    # Global change points
                 'parameters': {parameter_dict}
             }
         """
         if not similarities:
-            logger.warning("No similarity data provided for FLUSS segmentation")
+            logger.warning("No similarity data provided for DTW segmentation")
             return None
         
-        if SEGMENTATION_LIBRARY is None:
-            logger.error("STUMPY library not available. Cannot perform FLUSS segmentation.")
+        if DTW_LIBRARY is None:
+            logger.error("No DTW library available. Cannot perform DTW segmentation.")
             return None
         
-        logger.info(f"Starting FLUSS segmentation with window_size={window_size}, "
-                   f"num_regimes={num_regimes}, min_segment_length={min_segment_length}")
+        logger.info(f"Starting vector-based DTW segmentation with window_size={window_size}, "
+                   f"threshold={threshold}, min_segment_length={min_segment_length}")
         
         # Extract and sort frames by frame number
         sorted_frames = sorted(similarities.items(), 
@@ -1324,13 +1293,12 @@ class VideoAnalysisBackend:
         logger.info(f"Created vector time series: shape {vector_time_series.shape} "
                    f"({vector_time_series.shape[0]} frames × {vector_time_series.shape[1]} clusters)")
         
-        # Detect change points using FLUSS on the multivariate time series
-        change_points, arc_curve = self.detect_fluss_change_points_multivariate(
+        # Detect change points using DTW on the vector time series
+        change_points = self.detect_dtw_change_points_vector(
             vector_time_series,
             window_size=window_size,
-            num_regimes=num_regimes,
-            min_segment_length=min_segment_length,
-            return_arc_curve=True
+            threshold=threshold,
+            min_segment_length=min_segment_length
         )
         
         # Merge nearby change points
@@ -1347,28 +1315,27 @@ class VideoAnalysisBackend:
         
         # Compile results
         results = {
-            'method': 'fluss_matrix_profile',
+            'method': 'dtw_change_detection_vector',
             'segments': segments,  # Global segments (not per-cluster)
             'change_points': change_points,  # Global change points
-            'arc_curve': arc_curve.tolist() if arc_curve is not None else None,  # FLUSS arc curve
             'cluster_ids': cluster_ids,
             'parameters': {
                 'window_size': window_size,
-                'num_regimes': num_regimes,
+                'threshold': threshold,
                 'min_segment_length': min_segment_length,
-                'segmentation_library': SEGMENTATION_LIBRARY,
+                'dtw_library': DTW_LIBRARY,
                 'vector_dimensions': len(cluster_ids)
             },
             'num_clusters': len(cluster_ids),
             'total_frames': len(frame_numbers)
         }
         
-        logger.info(f"FLUSS segmentation completed: {len(segments)} segments")
+        logger.info(f"Vector-based DTW segmentation completed: {len(segments)} segments")
         
         return results
     
     def handle_full_video_analysis(self, video_path, peak_frames=None, cluster_assignments=None, num_workers=4, existing_pose_data=None, 
-                                   perform_segmentation=True, segmentation_window_size=10, segmentation_num_regimes=None, segmentation_min_segment_length=5):
+                                   perform_dtw_segmentation=False, dtw_window_size=10, dtw_threshold=1.5, dtw_min_segment_length=5):
         """
         Performs full video analysis with pose estimation, clustering, and similarity calculation.
         Uses parallel processing for improved performance.
@@ -1379,10 +1346,10 @@ class VideoAnalysisBackend:
             cluster_assignments: Dictionary of cluster assignments (optional)
             num_workers: Number of parallel workers
             existing_pose_data: Existing pose data to avoid reprocessing the entire video (optional)
-            perform_segmentation: Whether to perform FLUSS-based segmentation on similarity time series (default: True)
-            segmentation_window_size: Window size for FLUSS segmentation (default: 10)
-            segmentation_num_regimes: Number of regimes for FLUSS (if None, auto-detect)
-            segmentation_min_segment_length: Minimum segment length (default: 5)
+            perform_dtw_segmentation: Whether to perform DTW-based segmentation on similarity time series (default: False)
+            dtw_window_size: Window size for DTW segmentation (default: 10)
+            dtw_threshold: Threshold for DTW change detection (default: 1.5)
+            dtw_min_segment_length: Minimum segment length for DTW (default: 5)
             
         Returns:
             Tuple containing:
@@ -1390,7 +1357,7 @@ class VideoAnalysisBackend:
             - centroids: Dictionary of cluster centroids
             - similarities: Dictionary of cosine similarities
             - cluster_assignments: Dictionary of cluster assignments
-            - fluss_segmentation: Dictionary of FLUSS segmentation results (None if not performed)
+            - dtw_segmentation: Dictionary of DTW segmentation results (None if not performed)
         """
         # Log the start of processing
         if peak_frames:
@@ -1523,30 +1490,30 @@ class VideoAnalysisBackend:
                     similarities = self.smooth_cosine_similarities(similarities, window_size=5)
                     logger.info(f"Smoothed cosine similarities for {len(similarities)} frames")
                     
-                    # Optional Step 6: Perform FLUSS-based segmentation
-                    fluss_segmentation = None
-                    if perform_segmentation and similarities:
-                        logger.info("Step 6/6: Performing FLUSS-based segmentation on similarity time series...")
-                        fluss_segmentation = self.segment_cosine_similarity_with_fluss(
+                    # Optional Step 6: Perform DTW-based segmentation
+                    dtw_segmentation = None
+                    if perform_dtw_segmentation and similarities:
+                        logger.info("Step 6/6: Performing DTW-based segmentation on similarity time series...")
+                        dtw_segmentation = self.segment_cosine_similarity_with_dtw(
                             similarities,
-                            window_size=segmentation_window_size,
-                            num_regimes=segmentation_num_regimes,
-                            min_segment_length=segmentation_min_segment_length
+                            window_size=dtw_window_size,
+                            threshold=dtw_threshold,
+                            min_segment_length=dtw_min_segment_length
                         )
-                        if fluss_segmentation:
-                            logger.info(f"FLUSS segmentation completed: {fluss_segmentation['num_clusters']} clusters, "
-                                      f"{fluss_segmentation['total_frames']} frames")
+                        if dtw_segmentation:
+                            logger.info(f"DTW segmentation completed: {dtw_segmentation['num_clusters']} clusters, "
+                                      f"{dtw_segmentation['total_frames']} frames")
                         else:
-                            logger.warning("FLUSS segmentation failed")
+                            logger.warning("DTW segmentation failed")
                     else:
-                        fluss_segmentation = None
+                        dtw_segmentation = None
                 else:
                     logger.warning(f"Skipping similarity calculation - pose_data: {bool(pose_data)}, centroids: {bool(centroids)}")
-                    fluss_segmentation = None
+                    dtw_segmentation = None
             else:
-                fluss_segmentation = None
+                dtw_segmentation = None
             
-            return pose_data, centroids, similarities, cluster_assignments, fluss_segmentation
+            return pose_data, centroids, similarities, cluster_assignments, dtw_segmentation
             
         except Exception as e:
             logger.error(f"Error in full video analysis: {str(e)}")
@@ -1815,13 +1782,13 @@ class VideoAnalysisBackend:
             if peak_frames:
                 logger.info("Step 4/5: Performing clustering on peak frames...")
                 # Pass the existing pose_data to avoid reprocessing the entire video
-                # FLUSS segmentation enabled
-                _, centroids, similarities, cluster_assignments, fluss_segmentation = self.handle_full_video_analysis(
+                # Enable DTW segmentation automatically
+                _, centroids, similarities, cluster_assignments, dtw_segmentation = self.handle_full_video_analysis(
                     video_path, peak_frames=peak_frames, num_workers=num_workers, existing_pose_data=pose_data,
-                    perform_segmentation=True,  # FLUSS segmentation enabled
-                    segmentation_window_size=10,
-                    segmentation_num_regimes=None,  # Auto-detect number of regimes
-                    segmentation_min_segment_length=100)
+                    perform_dtw_segmentation=True,  # Enable DTW segmentation
+                    dtw_window_size=10,
+                    dtw_threshold=1.5,
+                    dtw_min_segment_length=5)
                 
                 if centroids:
                     logger.info(f"Created {len(centroids)} clusters")
@@ -1838,17 +1805,17 @@ class VideoAnalysisBackend:
                 else:
                     logger.warning("No cluster assignments were made")
                     
-                if fluss_segmentation:
-                    num_segments = len(fluss_segmentation.get('segments', []))
-                    logger.info(f"FLUSS segmentation completed: {fluss_segmentation['num_clusters']} clusters, "
+                if dtw_segmentation:
+                    num_segments = len(dtw_segmentation.get('segments', []))
+                    logger.info(f"DTW segmentation completed: {dtw_segmentation['num_clusters']} clusters, "
                               f"{num_segments} global segments")
                 else:
-                    logger.warning("No FLUSS segmentation results")
+                    logger.warning("No DTW segmentation results")
             else:
                 logger.info("Skipping clustering step - no peak frames available")
             
             logger.info("Complete analysis workflow finished")
-            return pose_data, eventfulness_data_dict, peak_frames, centroids, similarities, cluster_assignments, fluss_segmentation
+            return pose_data, eventfulness_data_dict, peak_frames, centroids, similarities, cluster_assignments, dtw_segmentation
             
         except Exception as e:
             logger.error(f"Error in complete analysis workflow: {str(e)}")
