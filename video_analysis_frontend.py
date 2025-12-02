@@ -10,8 +10,11 @@ import numpy as np
 from pathlib import Path
 import base64
 import logging
-from scipy.signal import find_peaks
 from video_analysis_backend import VideoAnalysisBackend
+
+# Note: Peak detection is ALWAYS done by the backend using VideoAnalysisBackend.detect_peaks()
+# The frontend NEVER performs its own peak detection to ensure consistency.
+# Peak data is stored in eventfulness_data['peak_indices'] and ['peak_values']
 
 # Set up logging
 log_file = "/home/is1893/Mirror2/video_analysis.log"
@@ -418,6 +421,13 @@ if os.path.exists(default_video_path):
                 "fps": default_config.get("fps", video_info['fps']),
                 "config_path": default_config_path
             }
+            
+            # Detect peaks using backend method for consistency
+            data = default_eventfulness_data['data']
+            peaks, peak_values, detection_params = backend.detect_peaks(data)
+            default_eventfulness_data['peak_indices'] = peaks
+            default_eventfulness_data['peak_values'] = peak_values
+            default_eventfulness_data['peak_detection_params'] = detection_params
 
 # Define the app layout
 app.layout = html.Div([
@@ -431,6 +441,7 @@ app.layout = html.Div([
     dcc.Store(id='cosine-similarity-data', data=None),
     dcc.Store(id='full-video-pose-data', data=None),
     dcc.Store(id='dtw-segmentation-data', data=None),
+    dcc.Store(id='peak-segmentation-data', data=None),
     
     # Main container
     html.Div([
@@ -527,6 +538,17 @@ app.layout = html.Div([
                     ),
                 ], className='section-card', id='dtw-segmentation-section', style={'display': 'none'}),
                 
+                # Peak-based segmentation section
+                html.Div([
+                    html.H3("Peak-Based Segmentation with Iterative Merging", style={'fontSize': '16px', 'fontWeight': '600', 'color': '#202123', 'marginBottom': '8px'}),
+                    html.Div(id='peak-segmentation-info', style={'fontSize': '13px', 'color': '#8e8ea0', 'marginBottom': '12px'}),
+                    dcc.Graph(
+                        id='peak-segmentation-graph',
+                        style={'height': '400px', 'width': '100%'},
+                        config={'displayModeBar': False, 'displaylogo': False}
+                    ),
+                ], className='section-card', id='peak-segmentation-section', style={'display': 'none'}),
+                
             ], className='content-area'),
         ], className='main-layout'),
     ], className='main-container'),
@@ -590,6 +612,8 @@ def update_video_list(current_video):
      Output('cosine-similarity-data', 'data', allow_duplicate=True),
      Output('cluster-centroids', 'data', allow_duplicate=True),
      Output('full-video-pose-data', 'data', allow_duplicate=True),
+     Output('dtw-segmentation-data', 'data', allow_duplicate=True),
+     Output('peak-segmentation-data', 'data', allow_duplicate=True),
      Output('analysis-status', 'children', allow_duplicate=True)],
     Input({'type': 'video-button', 'path': dash.ALL}, 'n_clicks'),
     State({'type': 'video-button', 'path': dash.ALL}, 'id'),
@@ -601,12 +625,12 @@ def select_video(n_clicks, ids, current_video):
     # Use callback context to find which button was clicked
     ctx = dash.callback_context
     if not ctx.triggered:
-        return dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update
+        return (dash.no_update,) * 11
     
     # Find the index of the clicked button
     triggered_prop = ctx.triggered[0]['prop_id']
     if not triggered_prop or '.n_clicks' not in triggered_prop:
-        return dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update
+        return (dash.no_update,) * 11
     
     # Find which button was clicked by checking which n_clicks changed
     clicked_index = None
@@ -616,25 +640,25 @@ def select_video(n_clicks, ids, current_video):
             break
     
     if clicked_index is None or clicked_index >= len(ids):
-        return dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update
+        return (dash.no_update,) * 11
     
     # Get the video path from the clicked button
     video_path = ids[clicked_index]['path']
     
     # If clicking the same video, don't reload
     if video_path == current_video:
-        return dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update
+        return (dash.no_update,) * 11
     
     # Validate video path exists
     if not video_path or not os.path.exists(video_path):
         logger.error(f"Video file not found: {video_path}")
-        return dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update
+        return (dash.no_update,) * 11
     
     # Get video info
     video_info = backend.get_video_info(video_path)
     if not video_info:
         logger.error(f"Failed to get video info for: {video_path}")
-        return video_path, None, None, None, None, None, None, None, ""
+        return video_path, None, None, None, None, None, None, None, None, None, ""
     
     # Find matching config and eventfulness data
     config_path, config = backend.find_matching_config(video_path)
@@ -647,12 +671,19 @@ def select_video(n_clicks, ids, current_video):
             "fps": config.get("fps", video_info['fps']),
             "config_path": config_path
         }
+        
+        # Detect peaks using backend method for consistency
+        data = eventfulness_data['data']
+        peaks, peak_values, detection_params = backend.detect_peaks(data)
+        eventfulness_data['peak_indices'] = peaks
+        eventfulness_data['peak_values'] = peak_values
+        eventfulness_data['peak_detection_params'] = detection_params
     
     # Clear previous video's analysis data when switching videos
     logger.info(f"Switching to video: {video_path}")
     
     # Return new video data and clear all analysis data from previous video
-    return video_path, video_info, eventfulness_data, None, None, None, None, None, ""
+    return video_path, video_info, eventfulness_data, None, None, None, None, None, None, None, ""
 
 # Callback to update video info display
 @callback(
@@ -747,16 +778,20 @@ def update_eventfulness_graph(eventfulness_data, video_info, current_video, curr
                        triggered_id in ['eventfulness-data', 'current-video', 'peak-frames'])
     
     if needs_new_figure:
-        # Initial graph creation - get peaks from peak_frames if available
-        # Otherwise use scipy's find_peaks with backend-consistent parameters
-        if peak_frames:
+        # Initial graph creation - ALWAYS use peaks from eventfulness data
+        # The backend stores peak detection results in eventfulness_data for consistency
+        if 'peak_indices' in eventfulness_data and 'peak_values' in eventfulness_data:
+            # Use pre-computed peaks from backend (guaranteed consistency)
+            peaks = eventfulness_data['peak_indices']
+            peak_values = eventfulness_data['peak_values']
+        elif peak_frames:
+            # Fallback: extract from peak_frames if available
             peaks = sorted([int(k) for k in peak_frames.keys()])
             peak_values = [data[p] for p in peaks if p < len(data)]
         else:
-            # Use backend-consistent parameters: height=0.3, distance=5
-            peaks, _ = find_peaks(data, height=0.3, distance=5)
-            peaks = peaks.tolist()
-            peak_values = [data[p] for p in peaks]
+            # No peaks available - show empty markers
+            peaks = []
+            peak_values = []
         
         # Create the graph
         fig = go.Figure()
@@ -890,11 +925,13 @@ def handle_video_playback(playing):
      Output('cosine-similarity-data', 'data', allow_duplicate=True),
      Output('full-video-pose-data', 'data', allow_duplicate=True),
      Output('dtw-segmentation-data', 'data', allow_duplicate=True),
+     Output('peak-segmentation-data', 'data', allow_duplicate=True),
      Output('analysis-status', 'children'),
      Output('graph-section', 'style', allow_duplicate=True),
      Output('peak-frames-section', 'style', allow_duplicate=True),
      Output('cosine-similarity-section', 'style', allow_duplicate=True),
-     Output('dtw-segmentation-section', 'style', allow_duplicate=True)],
+     Output('dtw-segmentation-section', 'style', allow_duplicate=True),
+     Output('peak-segmentation-section', 'style', allow_duplicate=True)],
     [Input('complete-analysis-btn', 'n_clicks')],
     [State('current-video', 'data'),
      State('video-info', 'data'),
@@ -904,7 +941,7 @@ def handle_video_playback(playing):
 def run_complete_analysis(n_clicks, video_path, video_info, delete_config):
     """Run the complete analysis workflow from start to finish."""
     if not n_clicks or not video_path or not video_info:
-        return dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, "", {'display': 'none'}, {'display': 'none'}, {'display': 'none'}, {'display': 'none'}
+        return (dash.no_update,) * 13
     
     logger.info(f"Starting complete analysis for: {video_path}")
     
@@ -923,7 +960,7 @@ def run_complete_analysis(n_clicks, video_path, video_info, delete_config):
         status_msg = html.Div("Starting complete analysis... This may take several minutes.", style={'color': '#10a37f'})
         
         # Run the complete analysis workflow
-        pose_data, eventfulness_data, peak_frames, centroids, similarities, cluster_assignments, dtw_segmentation = backend.run_complete_analysis(
+        pose_data, eventfulness_data, peak_frames, centroids, similarities, cluster_assignments, dtw_segmentation, peak_segmentation = backend.run_complete_analysis(
             video_path, num_workers=4)
         
         # Update status based on results
@@ -932,6 +969,7 @@ def run_complete_analysis(n_clicks, video_path, video_info, delete_config):
                 html.Div(f"✓ Analysis complete! Processed {len(pose_data)} frames, found {len(peak_frames)} peaks.", style={'color': '#10a37f', 'marginBottom': '4px'}),
                 html.Div(f"✓ Created {len(cluster_assignments) if cluster_assignments else 0} cluster assignments." if cluster_assignments else "⚠ No cluster assignments created.", style={'color': '#10a37f' if cluster_assignments else '#fbd38d'}),
                 html.Div(f"✓ DTW segmentation: {dtw_segmentation['num_clusters']} clusters segmented." if dtw_segmentation else "⚠ No DTW segmentation.", style={'color': '#10a37f' if dtw_segmentation else '#fbd38d', 'marginTop': '4px'}),
+                html.Div(f"✓ Peak segmentation: {peak_segmentation['initial_segment_count']} → {peak_segmentation['final_segment_count']} segments." if peak_segmentation else "⚠ No peak segmentation.", style={'color': '#10a37f' if peak_segmentation else '#fbd38d', 'marginTop': '4px'}),
             ])
         elif pose_data:
             status_msg = html.Div("⚠ Analysis partially complete. Pose estimation finished, but eventfulness data or peaks not found.", style={'color': '#fbd38d'})
@@ -943,17 +981,18 @@ def run_complete_analysis(n_clicks, video_path, video_info, delete_config):
         peak_style = {'display': 'block'} if peak_frames else {'display': 'none'}
         similarity_style = {'display': 'block'} if similarities and centroids else {'display': 'none'}
         dtw_style = {'display': 'block'} if dtw_segmentation else {'display': 'none'}
+        peak_seg_style = {'display': 'block'} if peak_segmentation else {'display': 'none'}
         
-        logger.info(f"Complete analysis finished. Results: pose_data={bool(pose_data)}, eventfulness={bool(eventfulness_data)}, peaks={len(peak_frames) if peak_frames else 0}, clusters={len(cluster_assignments) if cluster_assignments else 0}, dtw={bool(dtw_segmentation)}")
+        logger.info(f"Complete analysis finished. Results: pose_data={bool(pose_data)}, eventfulness={bool(eventfulness_data)}, peaks={len(peak_frames) if peak_frames else 0}, clusters={len(cluster_assignments) if cluster_assignments else 0}, dtw={bool(dtw_segmentation)}, peak_seg={bool(peak_segmentation)}")
         
-        return eventfulness_data, peak_frames, cluster_assignments, centroids, similarities, pose_data, dtw_segmentation, status_msg, graph_style, peak_style, similarity_style, dtw_style
+        return eventfulness_data, peak_frames, cluster_assignments, centroids, similarities, pose_data, dtw_segmentation, peak_segmentation, status_msg, graph_style, peak_style, similarity_style, dtw_style, peak_seg_style
         
     except Exception as e:
         logger.error(f"Error in complete analysis: {str(e)}")
         import traceback
         logger.error(traceback.format_exc())
         status_msg = html.Div(f"✗ Error during analysis: {str(e)}", style={'color': '#ef4444'})
-        return None, None, None, None, None, None, None, status_msg, {'display': 'none'}, {'display': 'none'}, {'display': 'none'}, {'display': 'none'}
+        return None, None, None, None, None, None, None, None, status_msg, {'display': 'none'}, {'display': 'none'}, {'display': 'none'}, {'display': 'none'}, {'display': 'none'}
 
 # Callback to update peak frames gallery
 @callback(
@@ -1297,6 +1336,197 @@ def visualize_dtw_segmentation(dtw_data, similarities, centroids):
         html.Span(f"Threshold: {params['threshold']} | ", style={'marginRight': '8px'}),
         html.Span(f"Min Length: {params['min_segment_length']} | ", style={'marginRight': '8px'}),
         html.Span(f"Dimensions: {params.get('vector_dimensions', 'N/A')}", style={'marginRight': '8px'}),
+    ])
+    
+    return fig, info_text, {'display': 'block'}
+
+# Callback to visualize peak-based segmentation results
+@callback(
+    [Output('peak-segmentation-graph', 'figure'),
+     Output('peak-segmentation-info', 'children'),
+     Output('peak-segmentation-section', 'style')],
+    [Input('peak-segmentation-data', 'data'),
+     Input('cosine-similarity-data', 'data'),
+     Input('cluster-centroids', 'data')]
+)
+def visualize_peak_segmentation(peak_seg_data, similarities, centroids):
+    """Create visualization of peak-based segmentation with merge history."""
+    if not peak_seg_data or not similarities or not centroids:
+        return dash.no_update, "", {'display': 'none'}
+    
+    # Extract frame numbers and times from similarities
+    frame_numbers = []
+    times = []
+    similarity_data = {cluster_id: [] for cluster_id in centroids.keys()}
+    
+    for frame_idx, data in similarities.items():
+        frame_numbers.append(data['frame_number'])
+        times.append(data['time'])
+        
+        for cluster_id, score in data['similarities'].items():
+            similarity_data[cluster_id].append(score)
+    
+    # Define color palette
+    cluster_colors = [
+        '#10a37f', '#8e8ea0', '#202123', '#565869', '#a5a5b1',
+        '#353740', '#6b7280', '#9ca3af', '#d1d5db', '#e5e7eb'
+    ]
+    
+    # Segment colors for final segments
+    segment_colors = [
+        '#FF6B6B', '#4ECDC4', '#45B7D1', '#FFA07A', '#98D8C8',
+        '#F7DC6F', '#BB8FCE', '#85C1E2', '#F8B739', '#E74C3C',
+        '#3498DB', '#E67E22', '#9B59B6', '#1ABC9C', '#F39C12'
+    ]
+    
+    # Create figure with subplots for each cluster
+    from plotly.subplots import make_subplots
+    
+    num_clusters = len(centroids)
+    fig = make_subplots(
+        rows=num_clusters, 
+        cols=1,
+        subplot_titles=[f'Cluster {cid}' for cid in sorted(centroids.keys())],
+        vertical_spacing=0.08,
+        shared_xaxes=True
+    )
+    
+    # Get final segments
+    final_segments = peak_seg_data.get('final_segments', [])
+    
+    # Plot each cluster's similarity with final segment boundaries
+    for i, cluster_id in enumerate(sorted(centroids.keys())):
+        row = i + 1
+        color = cluster_colors[int(cluster_id) % len(cluster_colors)]
+        
+        # Add similarity trace
+        fig.add_trace(
+            go.Scatter(
+                x=frame_numbers,
+                y=similarity_data[cluster_id],
+                mode='lines',
+                name=f'Cluster {cluster_id}',
+                line=dict(color=color, width=2),
+                opacity=0.7,
+                showlegend=False,
+                hovertemplate=f'<b>Cluster {cluster_id}</b><br>Frame: %{{x}}<br>Similarity: %{{y:.3f}}<extra></extra>'
+            ),
+            row=row, col=1
+        )
+        
+        # Add segment boundaries and shading
+        for seg in final_segments:
+            seg_id = seg.get('final_segment_id', seg.get('segment_id', 0))
+            seg_color = segment_colors[seg_id % len(segment_colors)]
+            
+            # Add vertical line at segment start
+            fig.add_vline(
+                x=seg['start_frame'],
+                line_dash="solid",
+                line_color=seg_color,
+                line_width=2,
+                opacity=0.6,
+                row=row, col=1
+            )
+            
+            # Add shaded region for segment (only on first row to avoid clutter)
+            if row == 1:
+                fig.add_vrect(
+                    x0=seg['start_frame'],
+                    x1=seg['end_frame'],
+                    fillcolor=seg_color,
+                    opacity=0.1,
+                    layer="below",
+                    line_width=0,
+                    row=row, col=1
+                )
+        
+        # Add segment labels (only on first row)
+        if row == 1:
+            for seg in final_segments:
+                seg_id = seg.get('final_segment_id', seg.get('segment_id', 0))
+                mid_frame = (seg['start_frame'] + seg['end_frame']) // 2
+                # Find max similarity across all clusters for positioning
+                max_sim = max(max(similarity_data[cid]) for cid in centroids.keys())
+                
+                # Create label text
+                label_text = f"<b>Seg {seg_id}</b>"
+                if 'merged_from' in seg:
+                    label_text += f"<br><span style='font-size:9px'>Merged: {len(seg['merged_from'])}</span>"
+                
+                fig.add_annotation(
+                    x=mid_frame,
+                    y=max_sim * 0.95,
+                    text=label_text,
+                    showarrow=False,
+                    font=dict(size=10, color='#202123'),
+                    bgcolor='rgba(255, 255, 255, 0.9)',
+                    bordercolor='#e5e5e5',
+                    borderwidth=1,
+                    borderpad=4,
+                    row=row, col=1
+                )
+    
+    # Update layout
+    fig.update_layout(
+        height=150 * num_clusters + 100,
+        showlegend=False,
+        margin=dict(l=50, r=30, t=50, b=40),
+        hovermode='closest',
+        plot_bgcolor='#ffffff',
+        paper_bgcolor='#ffffff',
+        font=dict(family='-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif', size=12)
+    )
+    
+    # Update axes
+    fig.update_xaxes(
+        title_text='Frame Number',
+        titlefont=dict(size=13, color='#8e8ea0'),
+        tickfont=dict(size=12, color='#8e8ea0'),
+        gridcolor='#f0f0f0',
+        zeroline=False,
+        showline=False,
+        row=num_clusters, col=1
+    )
+    
+    for i in range(1, num_clusters + 1):
+        fig.update_yaxes(
+            title_text='Similarity',
+            titlefont=dict(size=11, color='#8e8ea0'),
+            tickfont=dict(size=10, color='#8e8ea0'),
+            gridcolor='#f0f0f0',
+            zeroline=False,
+            showline=False,
+            row=i, col=1
+        )
+    
+    # Create info text with merge history
+    params = peak_seg_data['parameters']
+    merge_history = peak_seg_data.get('merge_history', [])
+    
+    info_text = html.Div([
+        html.Div([
+            html.Span(f"Method: Peak-based with Iterative Merging | ", style={'marginRight': '8px', 'fontWeight': '600'}),
+            html.Span(f"Initial Segments: {peak_seg_data['initial_segment_count']} | ", style={'marginRight': '8px'}),
+            html.Span(f"Final Segments: {peak_seg_data['final_segment_count']} | ", style={'marginRight': '8px'}),
+            html.Span(f"Merges: {len(merge_history)} | ", style={'marginRight': '8px'}),
+            html.Span(f"Similarity Threshold: {params['similarity_threshold']:.2f} | ", style={'marginRight': '8px'}),
+            html.Span(f"Peaks Used: {params['num_peaks']}", style={'marginRight': '8px'}),
+        ], style={'marginBottom': '8px'}),
+        html.Div([
+            html.Span("Merge History: ", style={'fontWeight': '600', 'marginRight': '8px'}),
+            html.Span(
+                ', '.join([
+                    f"Pass {m['pass']}: Seg {m['merged_segments'][0]}+{m['merged_segments'][1]} (sim={m['similarity']:.3f})" 
+                    for m in merge_history[:5]
+                ]), 
+                style={'fontSize': '12px', 'color': '#565869'}
+            ),
+            html.Span(
+                f"... and {len(merge_history) - 5} more" if len(merge_history) > 5 else "", 
+                style={'fontSize': '12px', 'color': '#8e8ea0', 'marginLeft': '8px'}
+            )
+        ]) if merge_history else None
     ])
     
     return fig, info_text, {'display': 'block'}

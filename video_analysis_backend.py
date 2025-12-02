@@ -44,12 +44,55 @@ RESULTS_DIR = "/home/is1893/Mirror2/dataSets/test_data/results"
 class VideoAnalysisBackend:
     """Backend class for video analysis with concurrent processing capabilities."""
     
+    # Peak detection parameters - shared between backend and frontend
+    PEAK_DETECTION_DISTANCE = 1  # Minimum distance between peaks
+    PEAK_DETECTION_PROMINENCE = 0.2  # Minimum prominence for peaks (how much they stand out)
+    
     def __init__(self):
         """Initialize the VideoAnalysisBackend."""
         self.mp_pose = mp.solutions.pose
         # Define which landmarks to keep (reduced face, hand, and foot vectors)
         # 0: nose, 11-16: shoulders/elbows/wrists, 23-28: hips/knees/ankles
         self.LANDMARKS_TO_KEEP = [0, 11, 12, 13, 14, 15, 16, 23, 24, 25, 26, 27, 28]
+    
+    @staticmethod
+    def detect_peaks(data, distance=None, prominence=None):
+        """
+        Detect peaks in eventfulness data using consistent parameters.
+        This method is used by both backend and frontend to ensure consistency.
+        
+        Args:
+            data: List or array of eventfulness values
+            distance: Minimum distance between peaks (default: class constant)
+            prominence: Minimum prominence for peaks - how much they stand out (default: class constant)
+            
+        Returns:
+            Tuple of (peak_indices, peak_values, detection_params)
+        """
+        from scipy.signal import find_peaks
+        
+        # Use class defaults if not specified
+        if distance is None:
+            distance = VideoAnalysisBackend.PEAK_DETECTION_DISTANCE
+        if prominence is None:
+            prominence = VideoAnalysisBackend.PEAK_DETECTION_PROMINENCE
+        
+        # Find peaks using scipy's find_peaks with prominence
+        peaks, properties = find_peaks(data, prominence=prominence, distance=distance)
+        
+        # Convert to list of integers and get peak values
+        peaks = [int(peak) for peak in peaks]
+        peak_values = [data[p] for p in peaks]
+        
+        # Store detection parameters for reproducibility
+        detection_params = {
+            'distance': distance,
+            'prominence': prominence,
+            'total_peaks_detected': len(peaks),
+            'peaks_kept': len(peaks)
+        }
+        
+        return peaks, peak_values, detection_params
     
     def get_video_info(self, video_path):
         """Extract basic information from a video file."""
@@ -1334,8 +1377,206 @@ class VideoAnalysisBackend:
         
         return results
     
+    def segment_by_peaks_with_merging(self, similarities, peak_frames, similarity_threshold=0.85, max_passes=10):
+        """
+        Segments the time series using eventfulness peaks as initial boundaries,
+        then iteratively merges similar neighboring segments.
+        
+        Args:
+            similarities: Dictionary mapping frame indices to similarity scores
+            peak_frames: Dictionary of peak frames from eventfulness detection
+            similarity_threshold: Threshold for merging segments (0-1, higher = more similar required)
+            max_passes: Maximum number of merging passes
+            
+        Returns:
+            Dictionary containing segmentation results with merge history
+        """
+        if not similarities or not peak_frames:
+            logger.warning("No similarity data or peak frames provided for peak-based segmentation")
+            return None
+        
+        logger.info(f"Starting peak-based segmentation with {len(peak_frames)} peaks")
+        
+        # Extract and sort frames by frame number
+        sorted_frames = sorted(similarities.items(), 
+                              key=lambda x: similarities[x[0]]['frame_number'])
+        
+        if not sorted_frames:
+            return None
+        
+        # Get cluster IDs from first frame
+        first_frame_key = sorted_frames[0][0]
+        cluster_ids = sorted(list(similarities[first_frame_key]['similarities'].keys()))
+        
+        # Extract frame numbers and times
+        frame_numbers = [similarities[frame_key]['frame_number'] for frame_key, _ in sorted_frames]
+        times = [similarities[frame_key]['time'] for frame_key, _ in sorted_frames]
+        
+        # Build multivariate time series
+        vector_time_series = []
+        for frame_key, _ in sorted_frames:
+            vector = [similarities[frame_key]['similarities'].get(cid, 0.0) for cid in cluster_ids]
+            vector_time_series.append(vector)
+        
+        vector_time_series = np.array(vector_time_series)
+        
+        # Create initial segments from peaks
+        # Sort peaks by frame number
+        peak_frame_numbers = sorted([peak_frames[pk]['frame_number'] for pk in peak_frames.keys()])
+        
+        # Map peak frame numbers to indices in the time series
+        peak_indices = []
+        for peak_frame in peak_frame_numbers:
+            # Find closest index in frame_numbers
+            closest_idx = min(range(len(frame_numbers)), 
+                            key=lambda i: abs(frame_numbers[i] - peak_frame))
+            peak_indices.append(closest_idx)
+        
+        # Remove duplicates and sort
+        peak_indices = sorted(list(set(peak_indices)))
+        
+        # Create initial boundaries: start, peaks, end
+        initial_boundaries = [0] + peak_indices + [len(frame_numbers)]
+        initial_boundaries = sorted(list(set(initial_boundaries)))
+        
+        logger.info(f"Created {len(initial_boundaries) - 1} initial segments from {len(peak_indices)} peaks")
+        
+        # Create initial segments
+        segments = self.create_segments_from_boundaries(
+            initial_boundaries,
+            frame_numbers,
+            times
+        )
+        
+        # Add similarity vectors to each segment
+        for seg in segments:
+            start_idx = initial_boundaries[seg['segment_id']]
+            end_idx = initial_boundaries[seg['segment_id'] + 1]
+            seg['start_idx'] = start_idx
+            seg['end_idx'] = end_idx
+            
+            # Calculate mean similarity vector for this segment
+            seg_vectors = vector_time_series[start_idx:end_idx]
+            seg['mean_vector'] = np.mean(seg_vectors, axis=0)
+            seg['std_vector'] = np.std(seg_vectors, axis=0)
+        
+        # Iterative merging process
+        merge_history = []
+        current_segments = segments.copy()
+        
+        for pass_num in range(max_passes):
+            if len(current_segments) <= 1:
+                logger.info(f"Only 1 segment remaining, stopping merging at pass {pass_num}")
+                break
+            
+            # Calculate similarity between all neighboring segments
+            merge_candidates = []
+            
+            for i in range(len(current_segments) - 1):
+                seg1 = current_segments[i]
+                seg2 = current_segments[i + 1]
+                
+                # Calculate cosine similarity between mean vectors
+                vec1 = seg1['mean_vector']
+                vec2 = seg2['mean_vector']
+                
+                # Normalize vectors
+                vec1_norm = vec1 / (np.linalg.norm(vec1) + 1e-10)
+                vec2_norm = vec2 / (np.linalg.norm(vec2) + 1e-10)
+                
+                # Cosine similarity
+                similarity = np.dot(vec1_norm, vec2_norm)
+                
+                merge_candidates.append({
+                    'index': i,
+                    'seg1_id': seg1['segment_id'],
+                    'seg2_id': seg2['segment_id'],
+                    'similarity': float(similarity)
+                })
+            
+            if not merge_candidates:
+                logger.info(f"No merge candidates found at pass {pass_num}")
+                break
+            
+            # Find the most similar pair
+            best_candidate = max(merge_candidates, key=lambda x: x['similarity'])
+            
+            # Check if similarity exceeds threshold
+            if best_candidate['similarity'] < similarity_threshold:
+                logger.info(f"Pass {pass_num}: Best similarity {best_candidate['similarity']:.3f} "
+                          f"below threshold {similarity_threshold}, stopping merging")
+                break
+            
+            # Merge the segments
+            idx = best_candidate['index']
+            seg1 = current_segments[idx]
+            seg2 = current_segments[idx + 1]
+            
+            # Create merged segment
+            merged_segment = {
+                'segment_id': seg1['segment_id'],  # Keep first segment's ID
+                'start_frame': seg1['start_frame'],
+                'end_frame': seg2['end_frame'],
+                'start_time': seg1['start_time'],
+                'end_time': seg2['end_time'],
+                'duration': seg2['end_time'] - seg1['start_time'],
+                'num_frames': seg1['num_frames'] + seg2['num_frames'],
+                'start_idx': seg1['start_idx'],
+                'end_idx': seg2['end_idx'],
+                'merged_from': [seg1['segment_id'], seg2['segment_id']]
+            }
+            
+            # Recalculate mean vector for merged segment
+            merged_vectors = vector_time_series[merged_segment['start_idx']:merged_segment['end_idx']]
+            merged_segment['mean_vector'] = np.mean(merged_vectors, axis=0)
+            merged_segment['std_vector'] = np.std(merged_vectors, axis=0)
+            
+            # Record merge
+            merge_history.append({
+                'pass': pass_num,
+                'merged_segments': [seg1['segment_id'], seg2['segment_id']],
+                'similarity': best_candidate['similarity'],
+                'new_segment_id': merged_segment['segment_id']
+            })
+            
+            # Update segments list
+            new_segments = current_segments[:idx] + [merged_segment] + current_segments[idx + 2:]
+            current_segments = new_segments
+            
+            logger.info(f"Pass {pass_num}: Merged segments {seg1['segment_id']} and {seg2['segment_id']} "
+                       f"(similarity: {best_candidate['similarity']:.3f}), "
+                       f"{len(current_segments)} segments remaining")
+        
+        # Renumber final segments
+        for i, seg in enumerate(current_segments):
+            seg['final_segment_id'] = i
+        
+        logger.info(f"Peak-based segmentation completed: {len(segments)} initial segments -> "
+                   f"{len(current_segments)} final segments after {len(merge_history)} merges")
+        
+        # Compile results
+        results = {
+            'method': 'peak_based_with_merging',
+            'initial_segments': segments,
+            'final_segments': current_segments,
+            'merge_history': merge_history,
+            'cluster_ids': cluster_ids,
+            'parameters': {
+                'similarity_threshold': similarity_threshold,
+                'max_passes': max_passes,
+                'num_peaks': len(peak_indices)
+            },
+            'num_clusters': len(cluster_ids),
+            'total_frames': len(frame_numbers),
+            'initial_segment_count': len(segments),
+            'final_segment_count': len(current_segments)
+        }
+        
+        return results
+    
     def handle_full_video_analysis(self, video_path, peak_frames=None, cluster_assignments=None, num_workers=4, existing_pose_data=None, 
-                                   perform_dtw_segmentation=False, dtw_window_size=10, dtw_threshold=1.5, dtw_min_segment_length=5):
+                                   perform_dtw_segmentation=False, dtw_window_size=10, dtw_threshold=1.5, dtw_min_segment_length=5,
+                                   perform_peak_segmentation=False, peak_similarity_threshold=0.85, peak_max_passes=10):
         """
         Performs full video analysis with pose estimation, clustering, and similarity calculation.
         Uses parallel processing for improved performance.
@@ -1350,6 +1591,9 @@ class VideoAnalysisBackend:
             dtw_window_size: Window size for DTW segmentation (default: 10)
             dtw_threshold: Threshold for DTW change detection (default: 1.5)
             dtw_min_segment_length: Minimum segment length for DTW (default: 5)
+            perform_peak_segmentation: Whether to perform peak-based segmentation with merging (default: False)
+            peak_similarity_threshold: Similarity threshold for merging segments (default: 0.85)
+            peak_max_passes: Maximum number of merging passes (default: 10)
             
         Returns:
             Tuple containing:
@@ -1358,6 +1602,7 @@ class VideoAnalysisBackend:
             - similarities: Dictionary of cosine similarities
             - cluster_assignments: Dictionary of cluster assignments
             - dtw_segmentation: Dictionary of DTW segmentation results (None if not performed)
+            - peak_segmentation: Dictionary of peak-based segmentation results (None if not performed)
         """
         # Log the start of processing
         if peak_frames:
@@ -1493,7 +1738,7 @@ class VideoAnalysisBackend:
                     # Optional Step 6: Perform DTW-based segmentation
                     dtw_segmentation = None
                     if perform_dtw_segmentation and similarities:
-                        logger.info("Step 6/6: Performing DTW-based segmentation on similarity time series...")
+                        logger.info("Step 6a/7: Performing DTW-based segmentation on similarity time series...")
                         dtw_segmentation = self.segment_cosine_similarity_with_dtw(
                             similarities,
                             window_size=dtw_window_size,
@@ -1507,17 +1752,38 @@ class VideoAnalysisBackend:
                             logger.warning("DTW segmentation failed")
                     else:
                         dtw_segmentation = None
+                    
+                    # Optional Step 7: Perform peak-based segmentation with merging
+                    peak_segmentation = None
+                    if perform_peak_segmentation and similarities and peak_frames:
+                        logger.info("Step 6b/7: Performing peak-based segmentation with iterative merging...")
+                        peak_segmentation = self.segment_by_peaks_with_merging(
+                            similarities,
+                            peak_frames,
+                            similarity_threshold=peak_similarity_threshold,
+                            max_passes=peak_max_passes
+                        )
+                        if peak_segmentation:
+                            logger.info(f"Peak-based segmentation completed: {peak_segmentation['initial_segment_count']} "
+                                      f"initial segments -> {peak_segmentation['final_segment_count']} final segments "
+                                      f"after {len(peak_segmentation['merge_history'])} merges")
+                        else:
+                            logger.warning("Peak-based segmentation failed")
+                    else:
+                        peak_segmentation = None
                 else:
                     logger.warning(f"Skipping similarity calculation - pose_data: {bool(pose_data)}, centroids: {bool(centroids)}")
                     dtw_segmentation = None
+                    peak_segmentation = None
             else:
                 dtw_segmentation = None
+                peak_segmentation = None
             
-            return pose_data, centroids, similarities, cluster_assignments, dtw_segmentation
+            return pose_data, centroids, similarities, cluster_assignments, dtw_segmentation, peak_segmentation
             
         except Exception as e:
             logger.error(f"Error in full video analysis: {str(e)}")
-            return None, None, None, cluster_assignments, None
+            return None, None, None, cluster_assignments, None, None
     
     def run_complete_analysis(self, video_path, num_workers=4):
         """
@@ -1665,33 +1931,16 @@ class VideoAnalysisBackend:
                 data = eventfulness_data_dict['data']
                 logger.info(f"Eventfulness data loaded: {len(data)} data points")
                 
-                # Detect local maxima (peaks) using scipy's find_peaks
-                # First detect all potential peaks with minimal filtering
-                from scipy.signal import find_peaks
-                all_peaks, properties = find_peaks(data, distance=1)
+                # Detect peaks using the centralized method
+                peaks, peak_values, detection_params = self.detect_peaks(data)
                 
-                # Calculate peak values
-                all_peak_values = [data[p] for p in all_peaks]
+                # Store peak detection parameters in eventfulness data for frontend consistency
+                eventfulness_data_dict['peak_indices'] = peaks
+                eventfulness_data_dict['peak_values'] = peak_values
+                eventfulness_data_dict['peak_detection_params'] = detection_params
                 
-                # Select top percentage of peaks (default: top 30%)
-                peak_percentage = 1.0  # Can be adjusted (0.0 to 1.0)
-                num_peaks_to_keep = max(1, int(len(all_peaks) * peak_percentage))
-                
-                # Sort peaks by their values (heights) in descending order
-                peak_value_pairs = list(zip(all_peaks, all_peak_values))
-                peak_value_pairs.sort(key=lambda x: x[1], reverse=True)
-                
-                # Keep only the top percentage
-                top_peaks = peak_value_pairs[:num_peaks_to_keep]
-                
-                # Sort back by frame index for chronological order
-                top_peaks.sort(key=lambda x: x[0])
-                
-                # Extract final peaks and values
-                peaks = [int(p[0]) for p in top_peaks]
-                peak_values = [p[1] for p in top_peaks]
-                
-                logger.info(f"Detected {len(all_peaks)} total peaks, selected top {peak_percentage*100:.0f}% ({len(peaks)} peaks)")
+                logger.info(f"Detected {detection_params['total_peaks_detected']} peaks "
+                          f"(prominence >= {detection_params['prominence']}, distance >= {detection_params['distance']})")
                 if len(peaks) > 0:
                     logger.info(f"Peak indices: {peaks[:10]}{'...' if len(peaks) > 10 else ''}")
                     logger.info(f"Peak values range: [{min(peak_values):.3f}, {max(peak_values):.3f}]")
@@ -1782,13 +2031,16 @@ class VideoAnalysisBackend:
             if peak_frames:
                 logger.info("Step 4/5: Performing clustering on peak frames...")
                 # Pass the existing pose_data to avoid reprocessing the entire video
-                # Enable DTW segmentation automatically
-                _, centroids, similarities, cluster_assignments, dtw_segmentation = self.handle_full_video_analysis(
+                # Enable both DTW and peak-based segmentation
+                _, centroids, similarities, cluster_assignments, dtw_segmentation, peak_segmentation = self.handle_full_video_analysis(
                     video_path, peak_frames=peak_frames, num_workers=num_workers, existing_pose_data=pose_data,
                     perform_dtw_segmentation=True,  # Enable DTW segmentation
                     dtw_window_size=10,
                     dtw_threshold=1.5,
-                    dtw_min_segment_length=5)
+                    dtw_min_segment_length=5,
+                    perform_peak_segmentation=True,  # Enable peak-based segmentation
+                    peak_similarity_threshold=0.95,
+                    peak_max_passes=10)
                 
                 if centroids:
                     logger.info(f"Created {len(centroids)} clusters")
@@ -1811,17 +2063,23 @@ class VideoAnalysisBackend:
                               f"{num_segments} global segments")
                 else:
                     logger.warning("No DTW segmentation results")
+                
+                if peak_segmentation:
+                    logger.info(f"Peak-based segmentation completed: {peak_segmentation['initial_segment_count']} "
+                              f"initial segments -> {peak_segmentation['final_segment_count']} final segments")
+                else:
+                    logger.warning("No peak-based segmentation results")
             else:
                 logger.info("Skipping clustering step - no peak frames available")
             
             logger.info("Complete analysis workflow finished")
-            return pose_data, eventfulness_data_dict, peak_frames, centroids, similarities, cluster_assignments, dtw_segmentation
+            return pose_data, eventfulness_data_dict, peak_frames, centroids, similarities, cluster_assignments, dtw_segmentation, peak_segmentation
             
         except Exception as e:
             logger.error(f"Error in complete analysis workflow: {str(e)}")
             import traceback
             logger.error(traceback.format_exc())
-            return None, None, None, None, None, None, None
+            return None, None, None, None, None, None, None, None
 
 # Example usage (commented out - use run_complete_analysis method instead)
 # if __name__ == "__main__":
