@@ -11,6 +11,7 @@ from pathlib import Path
 import base64
 import logging
 from video_analysis_backend import VideoAnalysisBackend
+from flask import request, jsonify
 
 # Note: Peak detection is ALWAYS done by the backend using VideoAnalysisBackend.detect_peaks()
 # The frontend NEVER performs its own peak detection to ensure consistency.
@@ -376,6 +377,60 @@ app.index_string = '''
                 background: #fffaf0;
                 color: #92400e;
             }
+            
+            /* Upload section styles */
+            .upload-section {
+                padding: 20px;
+                border-bottom: 1px solid #e5e5e5;
+                background: #f7f7f8;
+            }
+            
+            .upload-box {
+                border: 2px dashed #d1d5db;
+                border-radius: 8px;
+                padding: 30px;
+                text-align: center;
+                background: #ffffff;
+                transition: all 0.2s ease;
+                cursor: pointer;
+            }
+            
+            .upload-box:hover {
+                border-color: #10a37f;
+                background: #f9fafb;
+            }
+            
+            .upload-box.dragging {
+                border-color: #10a37f;
+                background: #f0fdf4;
+            }
+            
+            .upload-icon {
+                font-size: 48px;
+                color: #8e8ea0;
+                margin-bottom: 16px;
+            }
+            
+            .upload-text {
+                font-size: 14px;
+                color: #353740;
+                margin-bottom: 8px;
+            }
+            
+            .upload-subtext {
+                font-size: 12px;
+                color: #8e8ea0;
+            }
+            
+            .category-input {
+                margin-top: 16px;
+                padding: 10px;
+                border: 1px solid #d1d5db;
+                border-radius: 6px;
+                font-size: 14px;
+                width: 300px;
+                max-width: 100%;
+            }
         </style>
     </head>
     <body>
@@ -457,6 +512,37 @@ app.layout = html.Div([
                 html.Div([
                     html.H3("Videos"),
                 ], className='sidebar-header'),
+                
+                # Upload section
+                html.Div([
+                    html.Div([
+                        dcc.Upload(
+                            id='upload-video',
+                            children=html.Div([
+                                html.Div('📤', className='upload-icon'),
+                                html.Div('Upload Video', className='upload-text'),
+                                html.Div('Drag and drop or click to select', className='upload-subtext'),
+                            ]),
+                            className='upload-box',
+                            multiple=False,
+                            accept='video/*,.mp4,.avi,.mov,.mkv'
+                        ),
+                        dcc.Input(
+                            id='category-input',
+                            type='text',
+                            placeholder='Category name (optional)',
+                            className='category-input',
+                            style={'display': 'block', 'margin': '12px auto 0 auto'}
+                        ),
+                        html.Div(id='upload-status', style={
+                            'marginTop': '12px',
+                            'fontSize': '12px',
+                            'textAlign': 'center',
+                            'color': '#8e8ea0'
+                        }),
+                    ], style={'padding': '16px'}),
+                ], className='upload-section'),
+                
                 html.Div(id='video-list', className='video-list-container'),
             ], className='sidebar'),
             
@@ -561,6 +647,88 @@ app.layout = html.Div([
         disabled=False  # Start enabled, controlled by play/pause callback
     ),
 ])
+
+# Callback to handle video upload
+@callback(
+    [Output('upload-status', 'children'),
+     Output('upload-status', 'style'),
+     Output('current-video', 'data', allow_duplicate=True),
+     Output('video-info', 'data', allow_duplicate=True),
+     Output('eventfulness-data', 'data', allow_duplicate=True),
+     Output('peak-frames', 'data', allow_duplicate=True),
+     Output('cluster-assignments', 'data', allow_duplicate=True),
+     Output('cosine-similarity-data', 'data', allow_duplicate=True),
+     Output('cluster-centroids', 'data', allow_duplicate=True),
+     Output('full-video-pose-data', 'data', allow_duplicate=True),
+     Output('dtw-segmentation-data', 'data', allow_duplicate=True),
+     Output('peak-segmentation-data', 'data', allow_duplicate=True),
+     Output('analysis-status', 'children', allow_duplicate=True),
+     Output('category-input', 'value')],
+    [Input('upload-video', 'contents')],
+    [State('upload-video', 'filename'),
+     State('category-input', 'value')],
+    prevent_initial_call=True
+)
+def handle_video_upload(contents, filename, category_name):
+    """Handle video file upload."""
+    if not contents:
+        return dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update
+    
+    try:
+        # Parse the uploaded file content
+        content_type, content_string = contents.split(',')
+        decoded = base64.b64decode(content_string)
+        
+        # Save the video using backend
+        success, video_path, message = backend.save_uploaded_video(
+            decoded, filename, category_name if category_name else None
+        )
+        
+        if success:
+            # Get video info for the newly uploaded video
+            video_info = backend.get_video_info(video_path)
+            
+            # Find matching config (will be None for new videos)
+            config_path, config = backend.find_matching_config(video_path)
+            eventfulness_data = None
+            
+            if config and "eventfulness" in config and len(config["eventfulness"]) > 0:
+                eventfulness_data = {
+                    "data": config["eventfulness"][0],
+                    "full_vectors": config["eventfulness"],
+                    "fps": config.get("fps", video_info['fps']),
+                    "config_path": config_path
+                }
+                
+                # Detect peaks using backend method
+                data = eventfulness_data['data']
+                peaks, peak_values, detection_params = backend.detect_peaks(data)
+                eventfulness_data['peak_indices'] = peaks
+                eventfulness_data['peak_values'] = peak_values
+                eventfulness_data['peak_detection_params'] = detection_params
+            
+            logger.info(f"Video uploaded successfully: {video_path}")
+            
+            # Return success status and load the new video
+            status_style = {'marginTop': '12px', 'fontSize': '12px', 'textAlign': 'center', 'color': '#10a37f'}
+            return (message, status_style, video_path, video_info, eventfulness_data, 
+                   None, None, None, None, None, None, None, "", "")
+        else:
+            # Return error status
+            logger.error(f"Video upload failed: {message}")
+            status_style = {'marginTop': '12px', 'fontSize': '12px', 'textAlign': 'center', 'color': '#ef4444'}
+            return (message, status_style, dash.no_update, dash.no_update, dash.no_update,
+                   dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, 
+                   dash.no_update, dash.no_update, dash.no_update, dash.no_update)
+            
+    except Exception as e:
+        logger.error(f"Error handling video upload: {str(e)}")
+        import traceback
+        logger.error(traceback.format_exc())
+        status_style = {'marginTop': '12px', 'fontSize': '12px', 'textAlign': 'center', 'color': '#ef4444'}
+        return (f"Error: {str(e)}", status_style, dash.no_update, dash.no_update, dash.no_update,
+               dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update,
+               dash.no_update, dash.no_update, dash.no_update, dash.no_update)
 
 # Callback to list videos
 @callback(

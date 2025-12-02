@@ -123,6 +123,75 @@ class VideoAnalysisBackend:
         
         return video_info
     
+    def save_uploaded_video(self, file_content, original_filename, category_name=None):
+        """
+        Saves an uploaded video file to the appropriate directory structure.
+        
+        Args:
+            file_content: Binary content of the uploaded video file
+            original_filename: Original filename of the uploaded video
+            category_name: Optional category name for organizing videos (e.g., 'JumpJack', 'Pushup')
+                          If None, uses the filename without extension as category
+            
+        Returns:
+            Tuple of (success: bool, video_path: str, message: str)
+        """
+        try:
+            # Validate file extension
+            if not original_filename.lower().endswith(('.mp4', '.avi', '.mov', '.mkv')):
+                return False, None, "Invalid file format. Please upload a video file (.mp4, .avi, .mov, .mkv)"
+            
+            # Clean the filename
+            safe_filename = os.path.basename(original_filename)
+            filename_without_ext = os.path.splitext(safe_filename)[0]
+            
+            # Determine category name
+            if category_name is None:
+                category_name = filename_without_ext
+            
+            # Clean category name (remove special characters)
+            category_name = "".join(c for c in category_name if c.isalnum() or c in (' ', '-', '_')).strip()
+            if not category_name:
+                category_name = "Uploaded"
+            
+            # Create directory structure: /val/{category_name}/
+            val_dir = "/home/is1893/Mirror2/dataSets/test_data/val"
+            category_dir = os.path.join(val_dir, category_name)
+            os.makedirs(category_dir, exist_ok=True)
+            
+            # Determine final filename (use category name + .mp4 for consistency)
+            final_filename = f"{category_name}.mp4"
+            video_path = os.path.join(category_dir, final_filename)
+            
+            # Check if file already exists
+            if os.path.exists(video_path):
+                # Add timestamp to make unique
+                timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+                final_filename = f"{category_name}_{timestamp}.mp4"
+                video_path = os.path.join(category_dir, final_filename)
+            
+            # Save the file
+            with open(video_path, 'wb') as f:
+                f.write(file_content)
+            
+            # Verify the video can be opened
+            video_info = self.get_video_info(video_path)
+            if not video_info:
+                # If video is invalid, delete it
+                os.remove(video_path)
+                return False, None, "Uploaded file is not a valid video or cannot be processed"
+            
+            logger.info(f"Successfully saved uploaded video: {video_path}")
+            logger.info(f"Video info: {video_info['duration']:.1f}s, {video_info['width']}x{video_info['height']}, {video_info['fps']:.1f} fps")
+            
+            return True, video_path, f"Video uploaded successfully to {category_name}/{final_filename}"
+            
+        except Exception as e:
+            logger.error(f"Error saving uploaded video: {str(e)}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return False, None, f"Error saving video: {str(e)}"
+    
     def find_matching_config(self, video_path):
         """Find the matching config.json file for a given video path."""
         config_files = glob.glob(os.path.join(
