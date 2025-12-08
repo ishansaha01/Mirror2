@@ -38,6 +38,15 @@ except ImportError:
         DTW_LIBRARY = None
         logger.warning("No DTW library available. DTW segmentation will not be available.")
 
+# Wavelet imports
+try:
+    import pywt
+    WAVELET_LIBRARY = 'pywt'
+    logger.info("Using PyWavelets library for wavelet transforms")
+except ImportError:
+    WAVELET_LIBRARY = None
+    logger.warning("PyWavelets not available. Wavelet segmentation will not be available.")
+
 # Define constants
 RESULTS_DIR = "/home/is1893/Mirror2/dataSets/test_data/results"
 
@@ -192,17 +201,32 @@ class VideoAnalysisBackend:
             logger.error(traceback.format_exc())
             return False, None, f"Error saving video: {str(e)}"
     
-    def find_matching_config(self, video_path):
-        """Find the matching config.json file for a given video path."""
+    def find_matching_config(self, video_path, verbose=False):
+        """Find the matching config.json file for a given video path.
+        
+        Args:
+            video_path: Path to the video file
+            verbose: If True, log detailed search information (useful for debugging)
+        """
         config_files = glob.glob(os.path.join(
             RESULTS_DIR, "**/config.json"), recursive=True)
-            
+        
+        if verbose:
+            logger.info(f"Searching for config matching video: {video_path}")
+            logger.info(f"Found {len(config_files)} config files in {RESULTS_DIR}")
+        
         # Use realpath to resolve symlinks for proper path comparison
         video_path_normalized = os.path.realpath(video_path)
         video_filename = os.path.basename(video_path)
         
+        if verbose:
+            logger.info(f"  Normalized video path: {video_path_normalized}")
+            logger.info(f"  Video filename: {video_filename}")
+        
         for config_file in config_files:
             try:
+                if verbose:
+                    logger.info(f"  Checking config: {config_file}")
                 with open(config_file, 'r') as f:
                     config = json.load(f)
                 
@@ -210,14 +234,25 @@ class VideoAnalysisBackend:
                     config_video_path = config["video_path"]
                     config_video_filename = os.path.basename(config_video_path)
                     
+                    if verbose:
+                        logger.info(f"    Config video path: {config_video_path}")
+                        logger.info(f"    Config video filename: {config_video_filename}")
+                    
                     # Use realpath to resolve symlinks for proper path comparison
                     if (os.path.realpath(config_video_path) == video_path_normalized or
                             config_video_filename == video_filename):
+                        if verbose:
+                            logger.info(f"    ✓ Match found!")
                         return config_file, config
+                    else:
+                        if verbose:
+                            logger.info(f"    ✗ No match")
             except Exception as e:
                 logger.error(f"Error reading config file {config_file}: {str(e)}")
                 continue
-                
+        
+        if verbose:
+            logger.info(f"  No matching config found for {video_path}")
         return None, None
     
     def perform_pose_estimation(self, image, draw=False, normalize_centroid=True):
@@ -855,10 +890,11 @@ class VideoAnalysisBackend:
         
         return filtered_assignments, outlier_assignments
     
-    def calculate_cluster_centroids(self, peak_frames, cluster_assignments):
+    def calculate_cluster_centroids(self, peak_frames, cluster_assignments, max_clusters=3):
         """
         Calculates the centroid pose vector for each cluster.
         Uses NORMALIZED pose vectors to match what will be compared in cosine similarity.
+        Only keeps the top N largest clusters for cosine similarity calculation.
         
         Note: Clustering uses raw (non-normalized) vectors, but centroids are calculated
         from normalized vectors for proper cosine similarity comparison.
@@ -866,6 +902,7 @@ class VideoAnalysisBackend:
         Args:
             peak_frames: Dictionary of peak frames with pose vectors
             cluster_assignments: Dictionary mapping peak indices to cluster IDs
+            max_clusters: Maximum number of largest clusters to keep (default: 3)
             
         Returns:
             Dictionary mapping cluster IDs to centroid pose vectors (normalized)
@@ -885,6 +922,23 @@ class VideoAnalysisBackend:
                     if cluster_id not in clusters:
                         clusters[cluster_id] = []
                     clusters[cluster_id].append(pose_vector)
+        
+        # Find the top N largest clusters by number of members
+        cluster_sizes = {cluster_id: len(vectors) for cluster_id, vectors in clusters.items()}
+        
+        if len(cluster_sizes) > max_clusters:
+            # Sort clusters by size (descending) and keep only top N
+            top_clusters = sorted(cluster_sizes.items(), key=lambda x: x[1], reverse=True)[:max_clusters]
+            top_cluster_ids = [cluster_id for cluster_id, _ in top_clusters]
+            
+            logger.info(f"Filtering to top {max_clusters} largest clusters out of {len(cluster_sizes)} total clusters")
+            logger.info(f"Top clusters: {[(cid, cluster_sizes[cid]) for cid in top_cluster_ids]}")
+            
+            # Filter clusters to only keep top N
+            clusters = {cluster_id: vectors for cluster_id, vectors in clusters.items() 
+                       if cluster_id in top_cluster_ids}
+        else:
+            logger.info(f"Using all {len(cluster_sizes)} clusters (less than max_clusters={max_clusters})")
                     
         # Calculate centroid for each cluster
         centroids = {}
@@ -1643,9 +1697,322 @@ class VideoAnalysisBackend:
         
         return results
     
+    def segment_with_morlet_wavelet(self, similarities, freqs=None, threshold=None, min_segment_length=5, 
+                                     smoothing_sigma=0.1, fs=None):
+        """
+        Segments cosine similarity time series using Morlet wavelet transform with ADAPTIVE threshold.
+        
+        This method:
+        1. Computes the CWT scalogram with properly mapped frequencies
+        2. Extracts the dominant frequency over time (frequency centroid)
+        3. Smooths the frequency curve
+        4. Uses adaptive threshold based on signal statistics to detect frequency changes
+        
+        Args:
+            similarities: Dictionary mapping frame indices to similarity scores
+            freqs: Array of frequencies to analyze (Hz). Default: 0.1 to 5 Hz
+            threshold: Manual threshold override (Hz/s). If None, uses adaptive threshold
+            min_segment_length: Minimum frames per segment. Default: 5
+            smoothing_sigma: Gaussian smoothing sigma as fraction of fs. Default: 0.1
+            fs: Sampling rate (Hz). If None, estimated from timestamps.
+            
+        Returns:
+            Dictionary containing segmentation results with frequency-vs-time curve
+        """
+        from scipy.ndimage import gaussian_filter1d
+        
+        if WAVELET_LIBRARY is None:
+            logger.error("PyWavelets not available. Cannot perform wavelet segmentation.")
+            return None
+        
+        if not similarities:
+            logger.warning("No similarity data provided for wavelet segmentation")
+            return None
+        
+        logger.info(f"Starting frequency-based Morlet wavelet segmentation (adaptive threshold)")
+        
+        # Extract and sort frames by frame number
+        sorted_frames = sorted(similarities.items(), 
+                              key=lambda x: similarities[x[0]]['frame_number'])
+        
+        if not sorted_frames:
+            return None
+        
+        # Get cluster IDs from first frame
+        first_frame_key = sorted_frames[0][0]
+        cluster_ids = sorted(list(similarities[first_frame_key]['similarities'].keys()))
+        
+        # Extract frame numbers and times
+        frame_numbers = [similarities[frame_key]['frame_number'] for frame_key, _ in sorted_frames]
+        times = [similarities[frame_key]['time'] for frame_key, _ in sorted_frames]
+        
+        # Build multivariate time series
+        vector_time_series = []
+        for frame_key, _ in sorted_frames:
+            vector = [similarities[frame_key]['similarities'].get(cid, 0.0) for cid in cluster_ids]
+            vector_time_series.append(vector)
+        
+        vector_time_series = np.array(vector_time_series)
+        n_timepoints, n_clusters = vector_time_series.shape
+        
+        logger.info(f"Created vector time series: shape {vector_time_series.shape}")
+        
+        # Estimate sampling rate from timestamps if not provided
+        if fs is None:
+            if len(times) > 1:
+                dt = np.mean(np.diff(times))
+                fs = 1.0 / dt if dt > 0 else 30.0
+            else:
+                fs = 30.0  # Default assumption
+        
+        dt = 1.0 / fs
+        logger.info(f"Using sampling rate fs={fs:.2f} Hz (dt={dt:.4f}s)")
+        
+        # Define frequencies to analyze
+        # For movement analysis, we care about ~0.1 Hz (slow movements) to ~5 Hz (fast repetitions)
+        if freqs is None:
+            freqs = np.linspace(0.1, 5.0, 50)  # 50 frequency bins from 0.1 to 5 Hz
+        
+        freqs = np.array(freqs)
+        
+        # Compute scales from frequencies using the wavelet's central frequency
+        # For complex Morlet: scale = fc * fs / f
+        wavelet = 'cmor1.5-1.0'
+        try:
+            fc = pywt.central_frequency(wavelet)
+        except:
+            fc = 1.0  # Fallback
+        
+        scales = fc * fs / freqs
+        
+        logger.info(f"Analyzing {len(freqs)} frequencies from {freqs[0]:.2f} to {freqs[-1]:.2f} Hz")
+        logger.info(f"Corresponding scales from {scales[-1]:.2f} to {scales[0]:.2f}")
+        
+        # Compute wavelet transform for each cluster and aggregate
+        all_power = []
+        
+        for cluster_idx in range(n_clusters):
+            signal = vector_time_series[:, cluster_idx]
+            
+            # Preprocess: remove mean and normalize
+            signal_centered = signal - np.mean(signal)
+            signal_std = np.std(signal_centered)
+            if signal_std > 1e-10:
+                signal_normalized = signal_centered / signal_std
+            else:
+                signal_normalized = signal_centered
+            
+            # Apply CWT with proper sampling period
+            try:
+                coeffs, _ = pywt.cwt(signal_normalized, scales, wavelet, sampling_period=dt)
+            except Exception as e:
+                logger.warning(f"CWT failed for cluster {cluster_idx}: {e}")
+                continue
+            
+            # Power spectrum
+            power = np.abs(coeffs) ** 2
+            all_power.append(power)
+        
+        if not all_power:
+            logger.error("No valid CWT results")
+            return None
+        
+        # Average power across all clusters
+        mean_power = np.mean(all_power, axis=0)  # Shape: (n_freqs, n_timepoints)
+        
+        logger.info(f"Computed scalogram: shape {mean_power.shape}")
+        
+        # ===== Extract dominant frequency over time =====
+        # Method: Frequency centroid (energy-weighted average) - smoother than argmax
+        numerator = np.sum(mean_power.T * freqs, axis=1)
+        denominator = np.sum(mean_power, axis=0) + 1e-12
+        freq_centroid = numerator / denominator
+        
+        # Use frequency centroid as the main frequency curve
+        freq_curve = freq_centroid
+        
+        logger.info(f"Frequency curve: min={np.min(freq_curve):.3f} Hz, max={np.max(freq_curve):.3f} Hz, "
+                   f"mean={np.mean(freq_curve):.3f} Hz")
+        
+        # ===== Smooth the frequency curve =====
+        sigma_samples = int(smoothing_sigma * fs)
+        sigma_samples = max(1, sigma_samples)
+        freq_smooth = gaussian_filter1d(freq_curve, sigma=sigma_samples)
+        
+        logger.info(f"Applied Gaussian smoothing with sigma={sigma_samples} samples ({smoothing_sigma*1000:.0f}ms)")
+        
+        # ===== Compute rate of frequency change =====
+        # Derivative: Hz change per second
+        df = np.abs(np.diff(freq_smooth, prepend=freq_smooth[0])) * fs
+        
+        # Smooth the derivative as well
+        df_smooth = gaussian_filter1d(df, sigma=sigma_samples)
+        
+        # ===== ADAPTIVE THRESHOLD =====
+        # Calculate threshold based on signal statistics
+        if threshold is None:
+            # Use median + k * MAD (Median Absolute Deviation) for robustness
+            median_df = np.median(df_smooth)
+            mad = np.median(np.abs(df_smooth - median_df))
+            
+            # Adaptive threshold: median + 2.5 * MAD (robust equivalent of ~2.5 std)
+            # Scale factor of 1.4826 converts MAD to approximate std for normal distribution
+            adaptive_threshold = median_df + 2.5 * 1.4826 * mad
+            
+            # Also consider percentile-based threshold as a floor
+            percentile_threshold = np.percentile(df_smooth, 90)
+            
+            # Use the larger of the two to avoid over-segmentation
+            threshold = max(adaptive_threshold, percentile_threshold)
+            
+            # Ensure minimum threshold to avoid noise-triggered segments
+            min_threshold = 0.5  # At least 0.5 Hz/s change
+            threshold = max(threshold, min_threshold)
+            
+            logger.info(f"Adaptive threshold calculation:")
+            logger.info(f"  - Median df: {median_df:.4f} Hz/s")
+            logger.info(f"  - MAD: {mad:.4f} Hz/s")
+            logger.info(f"  - MAD-based threshold: {adaptive_threshold:.4f} Hz/s")
+            logger.info(f"  - 90th percentile threshold: {percentile_threshold:.4f} Hz/s")
+            logger.info(f"  - Final adaptive threshold: {threshold:.4f} Hz/s")
+        else:
+            logger.info(f"Using manual threshold: {threshold:.4f} Hz/s")
+        
+        # Find where frequency change exceeds threshold
+        change_candidates = np.where(df_smooth > threshold)[0]
+        
+        logger.info(f"Found {len(change_candidates)} candidate change points above threshold {threshold:.4f} Hz/s")
+        
+        # Cluster adjacent candidates into single boundaries
+        min_gap = max(int(0.2 * fs), min_segment_length)  # At least 0.2s or min_segment_length between boundaries
+        boundaries = []
+        
+        if len(change_candidates) > 0:
+            cluster_start = change_candidates[0]
+            for i in range(1, len(change_candidates)):
+                if change_candidates[i] - change_candidates[i-1] > min_gap:
+                    # End of cluster - take the middle point
+                    cluster_end = change_candidates[i-1]
+                    boundaries.append(int((cluster_start + cluster_end) // 2))
+                    cluster_start = change_candidates[i]
+            # Don't forget the last cluster
+            cluster_end = change_candidates[-1]
+            boundaries.append(int((cluster_start + cluster_end) // 2))
+        
+        # Create change points list with start and end
+        change_points = [0] + boundaries + [n_timepoints]
+        change_points = sorted(list(set(change_points)))  # Remove duplicates and sort
+        
+        logger.info(f"Detected {len(change_points) - 1} segments with {len(boundaries)} frequency change points")
+        
+        # Create segment objects with frequency info
+        segments = []
+        for i in range(len(change_points) - 1):
+            start_idx = change_points[i]
+            end_idx = change_points[i + 1]
+            
+            # Map to actual frame numbers
+            start_frame = frame_numbers[start_idx]
+            end_frame = frame_numbers[min(end_idx, len(frame_numbers) - 1)]
+            start_time = times[start_idx]
+            end_time = times[min(end_idx, len(times) - 1)]
+            
+            # Calculate segment's dominant frequency (median of smoothed freq in this segment)
+            segment_freqs = freq_smooth[start_idx:end_idx]
+            segment_freq_median = float(np.median(segment_freqs)) if len(segment_freqs) > 0 else 0.0
+            segment_freq_mean = float(np.mean(segment_freqs)) if len(segment_freqs) > 0 else 0.0
+            segment_freq_std = float(np.std(segment_freqs)) if len(segment_freqs) > 0 else 0.0
+            
+            segment = {
+                'segment_id': i,
+                'start_frame': int(start_frame),
+                'end_frame': int(end_frame),
+                'start_time': float(start_time),
+                'end_time': float(end_time),
+                'duration': float(end_time - start_time),
+                'num_frames': int(end_idx - start_idx),
+                'dominant_freq_hz': segment_freq_median,
+                'mean_freq_hz': segment_freq_mean,
+                'freq_std_hz': segment_freq_std
+            }
+            segments.append(segment)
+        
+        # Log segment frequencies
+        for seg in segments:
+            logger.info(f"  Segment {seg['segment_id']}: {seg['start_time']:.2f}s - {seg['end_time']:.2f}s, "
+                       f"freq={seg['dominant_freq_hz']:.2f} Hz (±{seg['freq_std_hz']:.2f})")
+        
+        # ===== Prepare visualization data =====
+        max_freqs_for_viz = 64
+        max_timepoints_for_viz = 1000
+        
+        # Downsample if needed
+        if mean_power.shape[0] > max_freqs_for_viz:
+            freq_indices = np.linspace(0, mean_power.shape[0] - 1, max_freqs_for_viz, dtype=int)
+            scalogram_viz = mean_power[freq_indices, :]
+            freqs_viz = freqs[freq_indices]
+        else:
+            scalogram_viz = mean_power
+            freqs_viz = freqs
+        
+        if scalogram_viz.shape[1] > max_timepoints_for_viz:
+            time_indices = np.linspace(0, scalogram_viz.shape[1] - 1, max_timepoints_for_viz, dtype=int)
+            scalogram_viz = scalogram_viz[:, time_indices]
+            frame_numbers_viz = [frame_numbers[i] for i in time_indices]
+            times_viz = [times[i] for i in time_indices]
+            freq_smooth_viz = [float(freq_smooth[i]) for i in time_indices]
+            df_smooth_viz = [float(df_smooth[i]) for i in time_indices]
+        else:
+            frame_numbers_viz = frame_numbers
+            times_viz = times
+            freq_smooth_viz = freq_smooth.tolist()
+            df_smooth_viz = df_smooth.tolist()
+        
+        # Normalize scalogram for visualization (per-frequency normalization)
+        scalogram_normalized = np.zeros_like(scalogram_viz)
+        for i in range(scalogram_viz.shape[0]):
+            row = scalogram_viz[i, :]
+            row_min, row_max = np.min(row), np.max(row)
+            if row_max - row_min > 1e-10:
+                scalogram_normalized[i, :] = (row - row_min) / (row_max - row_min)
+        
+        # Compile results
+        results = {
+            'method': 'morlet_wavelet_frequency',
+            'scalogram': scalogram_normalized.tolist(),
+            'scalogram_raw': scalogram_viz.tolist(),
+            'frequencies': freqs_viz.tolist(),  # Actual frequencies in Hz
+            'frame_numbers': frame_numbers_viz,
+            'times': times_viz,
+            'freq_curve': freq_smooth_viz,  # Dominant frequency over time (Hz)
+            'freq_change_rate': df_smooth_viz,  # Rate of frequency change (Hz/s)
+            'segments': segments,
+            'change_points': change_points,
+            'cluster_ids': cluster_ids,
+            'parameters': {
+                'freq_range_hz': [float(freqs[0]), float(freqs[-1])],
+                'num_frequencies': len(freqs),
+                'threshold_hz_per_s': float(threshold),
+                'threshold_type': 'adaptive' if threshold is None else 'manual',
+                'min_segment_length': min_segment_length,
+                'smoothing_sigma': smoothing_sigma,
+                'sampling_rate_hz': fs,
+                'wavelet_type': wavelet
+            },
+            'num_clusters': len(cluster_ids),
+            'total_frames': len(frame_numbers),
+            'num_segments': len(segments)
+        }
+        
+        logger.info(f"Frequency-based wavelet segmentation completed: {len(segments)} segments")
+        
+        return results
+    
     def handle_full_video_analysis(self, video_path, peak_frames=None, cluster_assignments=None, num_workers=4, existing_pose_data=None, 
                                    perform_dtw_segmentation=False, dtw_window_size=10, dtw_threshold=1.5, dtw_min_segment_length=5,
-                                   perform_peak_segmentation=False, peak_similarity_threshold=0.85, peak_max_passes=10):
+                                   perform_peak_segmentation=False, peak_similarity_threshold=0.85, peak_max_passes=10,
+                                   perform_wavelet_segmentation=False, wavelet_freqs=None, wavelet_threshold=None, 
+                                   wavelet_min_segment_length=5, wavelet_smoothing_sigma=0.1):
         """
         Performs full video analysis with pose estimation, clustering, and similarity calculation.
         Uses parallel processing for improved performance.
@@ -1663,6 +2030,11 @@ class VideoAnalysisBackend:
             perform_peak_segmentation: Whether to perform peak-based segmentation with merging (default: False)
             peak_similarity_threshold: Similarity threshold for merging segments (default: 0.85)
             peak_max_passes: Maximum number of merging passes (default: 10)
+            perform_wavelet_segmentation: Whether to perform Morlet wavelet-based segmentation (default: False)
+            wavelet_freqs: Array of frequencies (Hz) to analyze (default: 0.1-5 Hz)
+            wavelet_threshold: Threshold for frequency change detection in Hz/s (default: None = adaptive)
+            wavelet_min_segment_length: Minimum segment length for wavelet (default: 5)
+            wavelet_smoothing_sigma: Gaussian smoothing sigma as fraction of fs (default: 0.1)
             
         Returns:
             Tuple containing:
@@ -1672,6 +2044,7 @@ class VideoAnalysisBackend:
             - cluster_assignments: Dictionary of cluster assignments
             - dtw_segmentation: Dictionary of DTW segmentation results (None if not performed)
             - peak_segmentation: Dictionary of peak-based segmentation results (None if not performed)
+            - wavelet_segmentation: Dictionary of wavelet segmentation results (None if not performed)
         """
         # Log the start of processing
         if peak_frames:
@@ -1840,19 +2213,40 @@ class VideoAnalysisBackend:
                             logger.warning("Peak-based segmentation failed")
                     else:
                         peak_segmentation = None
+                    
+                    # Optional Step 8: Perform Morlet wavelet-based segmentation with adaptive threshold
+                    wavelet_segmentation = None
+                    if perform_wavelet_segmentation and similarities:
+                        logger.info("Step 6c/7: Performing Morlet wavelet-based segmentation (adaptive threshold)...")
+                        wavelet_segmentation = self.segment_with_morlet_wavelet(
+                            similarities,
+                            freqs=wavelet_freqs,
+                            threshold=wavelet_threshold,  # None = adaptive
+                            min_segment_length=wavelet_min_segment_length,
+                            smoothing_sigma=wavelet_smoothing_sigma
+                        )
+                        if wavelet_segmentation:
+                            logger.info(f"Wavelet segmentation completed: {wavelet_segmentation['num_segments']} segments "
+                                      f"(threshold: {wavelet_segmentation['parameters']['threshold_hz_per_s']:.2f} Hz/s)")
+                        else:
+                            logger.warning("Wavelet segmentation failed")
+                    else:
+                        wavelet_segmentation = None
                 else:
                     logger.warning(f"Skipping similarity calculation - pose_data: {bool(pose_data)}, centroids: {bool(centroids)}")
                     dtw_segmentation = None
                     peak_segmentation = None
+                    wavelet_segmentation = None
             else:
                 dtw_segmentation = None
                 peak_segmentation = None
+                wavelet_segmentation = None
             
-            return pose_data, centroids, similarities, cluster_assignments, dtw_segmentation, peak_segmentation
+            return pose_data, centroids, similarities, cluster_assignments, dtw_segmentation, peak_segmentation, wavelet_segmentation
             
         except Exception as e:
             logger.error(f"Error in full video analysis: {str(e)}")
-            return None, None, None, cluster_assignments, None, None
+            return None, None, None, cluster_assignments, None, None, None
     
     def run_complete_analysis(self, video_path, num_workers=4):
         """
@@ -1936,18 +2330,27 @@ class VideoAnalysisBackend:
                 
                 if remaining_time > 0:
                     check_start = time.time()
+                    check_count = 0
                     while time.time() - check_start < remaining_time:
                         # Check for eventfulness results in config.json
                         # The SLURM job updates the config.json file with eventfulness data
-                        config_path, config = self.find_matching_config(video_path)
+                        # Enable verbose logging every 10 checks to see detailed search info
+                        verbose = (check_count % 10 == 0)
+                        config_path, config = self.find_matching_config(video_path, verbose=verbose)
                         if config and "eventfulness" in config and len(config["eventfulness"]) > 0:
                             results_found = True
                             total_elapsed = time.time() - eventfulness_start_time
                             logger.info(f"Found eventfulness results in config: {config_path} (took {total_elapsed:.1f}s)")
                             break
                         
-                        logger.info("Still waiting for eventfulness results...")
-                        time.sleep(1)  # Check every 30 seconds
+                        logger.info(f"Still waiting for eventfulness results... Looking for config matching: {video_path}")
+                        if config_path:
+                            logger.info(f"  Found config at: {config_path}, but no eventfulness data yet")
+                        else:
+                            logger.info(f"  No config file found yet in: {RESULTS_DIR}")
+                        
+                        check_count += 1
+                        time.sleep(1)  # Check every second
                 else:
                     logger.info("Pose estimation took longer than expected, checking for results now...")
                     config_path, config = self.find_matching_config(video_path)
@@ -2097,11 +2500,13 @@ class VideoAnalysisBackend:
             cluster_assignments = None
             dtw_segmentation = None
             
+            wavelet_segmentation = None
+            
             if peak_frames:
                 logger.info("Step 4/5: Performing clustering on peak frames...")
                 # Pass the existing pose_data to avoid reprocessing the entire video
-                # Enable both DTW and peak-based segmentation
-                _, centroids, similarities, cluster_assignments, dtw_segmentation, peak_segmentation = self.handle_full_video_analysis(
+                # Enable DTW, peak-based, and wavelet segmentation
+                _, centroids, similarities, cluster_assignments, dtw_segmentation, peak_segmentation, wavelet_segmentation = self.handle_full_video_analysis(
                     video_path, peak_frames=peak_frames, num_workers=num_workers, existing_pose_data=pose_data,
                     perform_dtw_segmentation=True,  # Enable DTW segmentation
                     dtw_window_size=10,
@@ -2109,7 +2514,12 @@ class VideoAnalysisBackend:
                     dtw_min_segment_length=5,
                     perform_peak_segmentation=True,  # Enable peak-based segmentation
                     peak_similarity_threshold=0.95,
-                    peak_max_passes=10)
+                    peak_max_passes=10,
+                    perform_wavelet_segmentation=True,  # Enable wavelet segmentation with adaptive threshold
+                    wavelet_freqs=None,  # Use default frequency range (0.1-5 Hz)
+                    wavelet_threshold=None,  # Use adaptive threshold
+                    wavelet_min_segment_length=5,
+                    wavelet_smoothing_sigma=0.1)
                 
                 if centroids:
                     logger.info(f"Created {len(centroids)} clusters")
@@ -2138,17 +2548,23 @@ class VideoAnalysisBackend:
                               f"initial segments -> {peak_segmentation['final_segment_count']} final segments")
                 else:
                     logger.warning("No peak-based segmentation results")
+                
+                if wavelet_segmentation:
+                    logger.info(f"Wavelet segmentation completed: {wavelet_segmentation['num_segments']} segments "
+                              f"(adaptive threshold: {wavelet_segmentation['parameters']['threshold_hz_per_s']:.2f} Hz/s)")
+                else:
+                    logger.warning("No wavelet segmentation results")
             else:
                 logger.info("Skipping clustering step - no peak frames available")
             
             logger.info("Complete analysis workflow finished")
-            return pose_data, eventfulness_data_dict, peak_frames, centroids, similarities, cluster_assignments, dtw_segmentation, peak_segmentation
+            return pose_data, eventfulness_data_dict, peak_frames, centroids, similarities, cluster_assignments, dtw_segmentation, peak_segmentation, wavelet_segmentation
             
         except Exception as e:
             logger.error(f"Error in complete analysis workflow: {str(e)}")
             import traceback
             logger.error(traceback.format_exc())
-            return None, None, None, None, None, None, None, None
+            return None, None, None, None, None, None, None, None, None
 
 # Example usage (commented out - use run_complete_analysis method instead)
 # if __name__ == "__main__":
