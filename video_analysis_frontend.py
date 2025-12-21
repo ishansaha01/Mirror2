@@ -593,16 +593,13 @@ app.layout = html.Div([
                 
                 # Simplified frequency analysis section (shown directly under video when simplified view is on)
                 html.Div([
-                    html.Div([
-                        html.H3("Frequency Analysis", style={'fontSize': '16px', 'fontWeight': '600', 'color': '#202123', 'marginBottom': '4px'}),
-                        html.Div(id='simplified-freq-info', style={'fontSize': '12px', 'color': '#8e8ea0', 'marginBottom': '8px'}),
-                    ]),
+                    html.Div(id='simplified-freq-info', style={'display': 'none'}),  # Hidden info
                     dcc.Graph(
                         id='simplified-freq-graph',
-                        style={'height': '280px', 'width': '100%'},
-                        config={'displayModeBar': False, 'displaylogo': False}
+                        style={'height': '160px', 'width': '100%'},
+                        config={'displayModeBar': False, 'displaylogo': False, 'staticPlot': False}
                     ),
-                ], className='section-card', id='simplified-freq-section', style={'display': 'none', 'marginTop': '0', 'padding': '12px 16px'}),
+                ], id='simplified-freq-section', style={'display': 'none', 'maxWidth': '1200px', 'margin': '-24px auto 0 auto', 'padding': '0', 'background': 'transparent'}),
                 
                 # Hidden video info display (for callbacks)
                 html.Div(id='video-info-display', style={'display': 'none'}),
@@ -1867,7 +1864,7 @@ def visualize_wavelet_segmentation(wavelet_data, similarities, centroids):
      Input('simplified-view-toggle', 'value')]
 )
 def create_simplified_freq_graph(wavelet_data, simplified_view):
-    """Create a simplified frequency analysis graph showing only dominant frequency and change rate."""
+    """Create a simplified frequency analysis graph aligned with video scrollbar."""
     is_simplified = 'simplified' in (simplified_view or [])
     
     if not wavelet_data or not is_simplified:
@@ -1887,13 +1884,12 @@ def create_simplified_freq_graph(wavelet_data, simplified_view):
     if not frame_numbers or not freq_curve:
         return dash.no_update, "", {'display': 'none'}
     
-    # Create figure with two rows
+    # Create figure with two rows - no titles
     fig = make_subplots(
         rows=2, cols=1,
-        row_heights=[0.6, 0.4],
+        row_heights=[0.55, 0.45],
         shared_xaxes=True,
-        vertical_spacing=0.08,
-        subplot_titles=['Dominant Frequency Over Time', 'Frequency Change Rate']
+        vertical_spacing=0.02
     )
     
     # Segment colors
@@ -1908,13 +1904,13 @@ def create_simplified_freq_graph(wavelet_data, simplified_view):
         y=freq_curve,
         mode='lines',
         name='Dominant Frequency',
-        line=dict(color='#10a37f', width=2),
+        line=dict(color='#10a37f', width=1.5),
         fill='tozeroy',
-        fillcolor='rgba(16, 163, 127, 0.1)',
-        hovertemplate='Frame: %{x}<br>Frequency: %{y:.2f} Hz<extra></extra>'
+        fillcolor='rgba(16, 163, 127, 0.15)',
+        hovertemplate='Frame: %{x}<br>Freq: %{y:.2f} Hz<extra></extra>'
     ), row=1, col=1)
     
-    # Add segment frequency lines and labels
+    # Add segment frequency lines
     for seg in segments:
         seg_id = seg.get('segment_id', 0)
         seg_color = segment_colors[seg_id % len(segment_colors)]
@@ -1927,18 +1923,7 @@ def create_simplified_freq_graph(wavelet_data, simplified_view):
             type="line",
             x0=start_frame, x1=end_frame,
             y0=dom_freq, y1=dom_freq,
-            line=dict(color=seg_color, width=3),
-            row=1, col=1
-        )
-        
-        # Add segment label
-        mid_frame = (start_frame + end_frame) // 2
-        fig.add_annotation(
-            x=mid_frame,
-            y=dom_freq + 0.15,
-            text=f"<b>{dom_freq:.1f} Hz</b>",
-            showarrow=False,
-            font=dict(size=10, color=seg_color),
+            line=dict(color=seg_color, width=2),
             row=1, col=1
         )
     
@@ -1949,23 +1934,11 @@ def create_simplified_freq_graph(wavelet_data, simplified_view):
             y=freq_change_rate,
             mode='lines',
             name='Change Rate',
-            line=dict(color='#ef4444', width=1.5),
+            line=dict(color='#ef4444', width=1),
             fill='tozeroy',
-            fillcolor='rgba(239, 68, 68, 0.1)',
-            hovertemplate='Frame: %{x}<br>Change Rate: %{y:.2f} Hz/s<extra></extra>'
+            fillcolor='rgba(239, 68, 68, 0.15)',
+            hovertemplate='Frame: %{x}<br>Change: %{y:.2f} Hz/s<extra></extra>'
         ), row=2, col=1)
-        
-        # Add threshold line
-        fig.add_hline(
-            y=threshold,
-            line_dash="dash",
-            line_color="rgba(239, 68, 68, 0.5)",
-            line_width=1,
-            annotation_text=f"Threshold: {threshold:.1f} Hz/s",
-            annotation_position="right",
-            annotation_font_size=9,
-            row=2, col=1
-        )
     
     # Add segment boundaries
     for cp_idx in change_points[1:-1]:  # Skip first and last
@@ -1974,67 +1947,56 @@ def create_simplified_freq_graph(wavelet_data, simplified_view):
             for row in [1, 2]:
                 fig.add_vline(
                     x=frame_num,
-                    line_dash="dash",
-                    line_color="rgba(100, 100, 100, 0.5)",
-                    line_width=1.5,
+                    line_dash="dot",
+                    line_color="rgba(80, 80, 80, 0.4)",
+                    line_width=1,
                     row=row, col=1
                 )
     
-    # Update layout
+    # Update layout - minimal margins to align with video
     fig.update_layout(
-        height=280,
+        height=160,
         showlegend=False,
-        margin=dict(l=50, r=20, t=35, b=35),
-        plot_bgcolor='#ffffff',
-        paper_bgcolor='#ffffff',
-        font=dict(family='-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif', size=11)
+        margin=dict(l=0, r=0, t=0, b=0),
+        plot_bgcolor='rgba(250,250,250,0.5)',
+        paper_bgcolor='rgba(255,255,255,0)',
+        font=dict(family='-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif', size=9),
+        hovermode='x unified'
     )
     
-    # Update axes
+    # Update axes - no titles, minimal ticks
     fig.update_yaxes(
-        title_text='Freq (Hz)',
-        titlefont=dict(size=10, color='#8e8ea0'),
-        tickfont=dict(size=9, color='#8e8ea0'),
-        gridcolor='#f0f0f0',
+        showticklabels=False,
+        showgrid=True,
+        gridcolor='rgba(200,200,200,0.3)',
         zeroline=False,
+        showline=False,
         row=1, col=1
     )
     fig.update_yaxes(
-        title_text='Hz/s',
-        titlefont=dict(size=10, color='#8e8ea0'),
-        tickfont=dict(size=9, color='#8e8ea0'),
-        gridcolor='#f0f0f0',
+        showticklabels=False,
+        showgrid=True,
+        gridcolor='rgba(200,200,200,0.3)',
         zeroline=False,
+        showline=False,
         row=2, col=1
     )
     fig.update_xaxes(
-        title_text='Frame Number',
-        titlefont=dict(size=10, color='#8e8ea0'),
-        tickfont=dict(size=9, color='#8e8ea0'),
-        gridcolor='#f0f0f0',
+        showticklabels=False,
+        showgrid=False,
         zeroline=False,
+        showline=False,
+        row=1, col=1
+    )
+    fig.update_xaxes(
+        showticklabels=False,
+        showgrid=False,
+        zeroline=False,
+        showline=False,
         row=2, col=1
     )
     
-    # Create info text
-    num_segments = len(segments)
-    threshold_type = params.get('threshold_type', 'manual')
-    info_parts = [f"{num_segments} segments"]
-    if threshold_type == 'adaptive':
-        info_parts.append(f"adaptive threshold: {threshold:.2f} Hz/s")
-    else:
-        info_parts.append(f"threshold: {threshold:.2f} Hz/s")
-    
-    # Add segment frequencies
-    if segments:
-        freq_strs = [f"Seg {s['segment_id']}: {s['dominant_freq_hz']:.1f}Hz" for s in segments[:5]]
-        if len(segments) > 5:
-            freq_strs.append(f"...+{len(segments)-5} more")
-        info_parts.append(" | ".join(freq_strs))
-    
-    info_text = " • ".join(info_parts)
-    
-    return fig, info_text, {'display': 'block', 'marginTop': '0', 'padding': '12px 16px'}
+    return fig, "", {'display': 'block', 'maxWidth': '1200px', 'margin': '-20px auto 16px auto', 'padding': '0', 'background': 'transparent'}
 
 # Callback to control section visibility based on simplified view toggle
 @callback(
