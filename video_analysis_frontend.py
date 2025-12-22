@@ -548,6 +548,11 @@ app.layout = html.Div([
                                       style={'background': '#ffffff', 'color': '#353740', 'fontWeight': '500', 
                                             'padding': '12px 24px', 'fontSize': '15px', 'cursor': 'pointer',
                                             'border': '1px solid #d1d5db'}),
+                            html.Button("🗑️ Clear Data Folders", id='clear-data-folders-btn', n_clicks=0, 
+                                      className='btn btn-danger', 
+                                      style={'background': '#ffffff', 'color': '#ef4444', 'fontWeight': '500', 
+                                            'padding': '12px 24px', 'fontSize': '15px', 'cursor': 'pointer',
+                                            'border': '1px solid #fca5a5'}),
                         ], style={'display': 'flex', 'justifyContent': 'center', 'alignItems': 'center', 'gap': '12px'}),
                         html.Div([
                             dcc.Checklist(
@@ -559,6 +564,7 @@ app.layout = html.Div([
                         ], style={'marginTop': '8px'}),
                         html.Div(id='analysis-status', style={'marginTop': '12px', 'fontSize': '13px', 'color': '#8e8ea0', 'minHeight': '20px'}),
                         html.Div(id='reload-status', style={'marginTop': '8px', 'fontSize': '12px', 'color': '#8e8ea0', 'minHeight': '16px'}),
+                        html.Div(id='clear-data-status', style={'marginTop': '8px', 'fontSize': '12px', 'color': '#8e8ea0', 'minHeight': '16px'}),
                     ], style={'textAlign': 'center', 'maxWidth': '1200px', 'margin': '0 auto'}),
                 ], className='analysis-control-section', id='analysis-control-section', style={'display': 'none'}),
                 
@@ -2066,6 +2072,54 @@ def serve_frame(frame_path):
         return Response("Frame not found", status=404)
     
     return send_file(full_path)
+
+# Callback to clear data folders (lossAccuracyReport and pose-photos)
+@callback(
+    Output('clear-data-status', 'children'),
+    Input('clear-data-folders-btn', 'n_clicks'),
+    prevent_initial_call=True
+)
+def clear_data_folders(n_clicks):
+    """Clear the lossAccuracyReport and pose-photos folders."""
+    import shutil
+    
+    if not n_clicks:
+        return ""
+    
+    folders_to_clear = [
+        "/home/is1893/Mirror2/scripts/lossAccuracyReport",
+        "/home/is1893/Mirror2/pose-photos",
+        "/home/is1893/Mirror2/pose-results"
+    ]
+    
+    results = []
+    
+    for folder_path in folders_to_clear:
+        folder_name = os.path.basename(folder_path)
+        try:
+            if os.path.exists(folder_path):
+                # Count items before clearing
+                items = os.listdir(folder_path)
+                item_count = len(items)
+                
+                # Remove all contents but keep the folder
+                for item in items:
+                    item_path = os.path.join(folder_path, item)
+                    if os.path.isdir(item_path):
+                        shutil.rmtree(item_path)
+                    else:
+                        os.remove(item_path)
+                
+                results.append(f"✓ {folder_name}: cleared {item_count} items")
+            else:
+                results.append(f"⚠ {folder_name}: folder not found")
+        except Exception as e:
+            results.append(f"✗ {folder_name}: error - {str(e)}")
+    
+    return html.Div([
+        html.Span("Data folders cleared: ", style={'color': '#10a37f', 'fontWeight': '500'}),
+        html.Span(" | ".join(results))
+    ])
 
 if __name__ == '__main__':
     app.run_server(debug=True, port=8050)

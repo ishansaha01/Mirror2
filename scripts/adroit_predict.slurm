@@ -8,7 +8,7 @@
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=16G
 #SBATCH --partition=all
-#SBATCH --gres=gpu:1
+#SBATCH --gres=gpu:2
 #SBATCH --constraint=a100  # Use A100 GPUs (change to v100 if needed)
 
 # Load modules
@@ -56,5 +56,4 @@ python predict.py --data_dir /scratch/network/is1893/mirror2_data/dataSets/test_
     --ngpu 2 --nepoch 1 --nworker 4 \
     --label_type none \
     --num_accS_dir 4 --num_velS_dir 4 --num_blurrs 4 \
-    --prediction_window_step 24 \
     --load_model --load_model_dir /scratch/network/is1893/mirror2_data/checkpoints --load_epoch 61
