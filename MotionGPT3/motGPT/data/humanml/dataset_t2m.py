@@ -151,6 +151,9 @@ class Text2MotionDataset(data.Dataset):
                 except:
                     pass
 
+            if len(new_name_list) == 0:
+                raise ValueError(f"No valid data found in {split} split. Please ensure that motion files exist in {motion_dir} and text files exist in {text_dir}.")
+            
             name_list, length_list = zip(
                 *sorted(zip(new_name_list, length_list), key=lambda x: x[1]))
 

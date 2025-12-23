@@ -20,7 +20,7 @@ DATASET:
 
 METRIC:
   TM2T:
-    t2m_path: deps/t2m/ # path for tm2t evaluator
+    t2m_path: deps/t2m/t2m/ # path for tm2t evaluator
   TMR:
     tmr_path: deps/tmr/tmr_humanml3d_guoh3dfeats/
 

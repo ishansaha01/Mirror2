@@ -36,7 +36,7 @@ class HumanML3DDataModule(BASEDataModule):
         # Mean and std of the dataset
         # if True:
         if cfg.model.params.motion_vae.target.split('.')[-1].lower() == "vqvae":
-            dis_data_root = pjoin(cfg.DATASET.HUMANML3D.MEAN_STD_PATH, 't2m', "VQVAEV3_CB1024_CMT_H1024_NRES3", "meta")
+            dis_data_root = pjoin(cfg.DATASET.HUMANML3D.MEAN_STD_PATH, 't2m', 't2m', "VQVAEV3_CB1024_CMT_H1024_NRES3", "meta")
             self.hparams.mean = np.load(pjoin(dis_data_root, "mean.npy"))
             self.hparams.std = np.load(pjoin(dis_data_root, "std.npy"))
         else:
@@ -48,7 +48,7 @@ class HumanML3DDataModule(BASEDataModule):
             self.hparams.mean_eval = np.load(pjoin(data_root, "tmr_mean.npy"))
             self.hparams.std_eval = np.load(pjoin(data_root, "tmr_std.npy"))
         else:
-            dis_data_root_eval = pjoin(cfg.DATASET.HUMANML3D.MEAN_STD_PATH, 't2m', "Comp_v6_KLD01", "meta")
+            dis_data_root_eval = pjoin(cfg.DATASET.HUMANML3D.MEAN_STD_PATH, 't2m', 't2m', "Comp_v6_KLD01", "meta")
             self.hparams.mean_eval = np.load(pjoin(dis_data_root_eval, "mean.npy"))
             self.hparams.std_eval = np.load(pjoin(dis_data_root_eval, "std.npy"))
         # self.hparams.mean_eval = np.load(pjoin(data_root, "Mean.npy"))
