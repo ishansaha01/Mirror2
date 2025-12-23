@@ -1,0 +1,21 @@
+**/__pycache__/**
+*.pyc
+
+code_for_demo/
+demos/
+experiments/
+results/
+mld/
+mot_gpt2/
+save_model_weights.py
+mGPTv3/
+motGPT-0/
+README0.md
+# app.py
+# assets/*
+test_folder.py
+ig-*.py
+
+# Large files stored on scratch (symlinked)
+deps/
+checkpoints/
