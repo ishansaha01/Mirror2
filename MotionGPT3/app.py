@@ -32,6 +32,9 @@ if cfg.ACCELERATOR == "gpu":
     device = torch.device("cuda")
 else:
     device = torch.device("cpu")
+# Use environment variable for dataset path if available
+if "DATASET_ROOT" in os.environ:
+    cfg.DATASET.HUMANML3D.ROOT = os.environ["DATASET_ROOT"]
 datamodule = build_data(cfg, phase="test")
 model = build_model(cfg, datamodule).eval()
 state_dict = torch.load(cfg.TEST.CHECKPOINTS, map_location="cpu")["state_dict"]
