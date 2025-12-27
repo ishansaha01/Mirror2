@@ -5,6 +5,7 @@ import time
 import numpy as np
 import pytorch_lightning as pl
 import torch
+from os.path import join as pjoin
 # from rich import get_console
 # from rich.table import Table
 from omegaconf import OmegaConf
@@ -124,6 +125,11 @@ def main():
         device = torch.device("cuda")
 
     # Dataset
+    # Use environment variable for dataset path if available
+    if "DATASET_ROOT" in os.environ:
+        cfg.DATASET.HUMANML3D.ROOT = os.environ["DATASET_ROOT"]
+        
+    # Now build the data module
     datamodule = build_data(cfg)
     logger.info("datasets module {} initialized".format("".join(
         cfg.DATASET.target.split('.')[-2])))

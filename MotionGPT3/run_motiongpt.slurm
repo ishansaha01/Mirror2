@@ -66,6 +66,9 @@ mkdir -p /scratch/network/is1893/mirror2_data/dataSets/test_data/results
 # Navigate to MotionGPT3 directory
 cd /home/is1893/Mirror2/MotionGPT3
 
+# Set dataset root to use absolute path
+export DATASET_ROOT="/scratch/network/is1893/mirror2_data/humanml3d"
+
 # ============================================
 # Configure which script to run and parameters
 # ============================================

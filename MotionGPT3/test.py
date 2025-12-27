@@ -62,6 +62,9 @@ def main():
     logger.info("Callbacks initialized")
 
     # Dataset
+    # Use environment variable for dataset path if available
+    if "DATASET_ROOT" in os.environ:
+        cfg.DATASET.HUMANML3D.ROOT = os.environ["DATASET_ROOT"]
     datamodule = build_data(cfg)
     logger.info("datasets module {} initialized".format("".join(
         cfg.DATASET.target.split('.')[-2])))
